@@ -221,6 +221,13 @@ def load_dir(dirpath):
             f"no such directory: {dirpath}\n"
             "  An absent registration directory is a broken checkout, not an empty list.")
     names = sorted(os.listdir(dirpath))          # never the OS's order: it is not stable
+    # Dotfiles are SKIPPED rather than counted stray, and that is what makes "no mirrors yet"
+    # expressible at all: git cannot track an empty directory, while an ABSENT one is a hard failure
+    # just above (rightly -- it means a broken checkout), so the empty state can only be held open
+    # by a placeholder like `.gitkeep`. Nothing is lost by ignoring them: a dotfile could never be a
+    # registration, because `name` must match NAME_RE, which cannot begin with a dot, and the
+    # filename has to equal `name`.
+    names = [n for n in names if not n.startswith(".")]
     stray = [n for n in names if not n.endswith(".json")]
     if stray:
         raise MirrorListError(
@@ -455,6 +462,14 @@ def _selftest():
         os.makedirs(empty)
         ok("an empty registration directory loads as an empty list",
            lambda: assert_(load_dir(empty) == [], "an empty directory did not load"))
+
+        # The state this repo actually ships in until a mirror exists. git cannot track an empty
+        # directory, and a MISSING one is refused below, so without this the "no mirrors yet" list
+        # is unpublishable and CI fails on a checkout that is perfectly correct.
+        with open(os.path.join(empty, ".gitkeep"), "w", encoding="utf-8") as fh:
+            fh.write("")
+        ok("a .gitkeep holding the directory open is skipped, not called stray",
+           lambda: assert_(load_dir(empty) == [], "the placeholder was treated as a registration"))
 
     refused("a registration directory that does not exist",
             lambda: load_dir(os.path.join("no", "such", "dir")))
