@@ -44,6 +44,17 @@ on:
 permissions:
   contents: write        # create the Release
 
+# ONE publish at a time. The serial is derived by READING what is published, so two runs overlapping
+# — two pull requests merged minutes apart — both read serial N and both derive N+1. The loser then
+# collides on the tag and fails, which is loud and re-runnable, but it fails AFTER sealing and after
+# creating a draft. Serialising the job makes the second run read the first one's published result,
+# which is the number it was always meant to read. `cancel-in-progress: false` because the run being
+# cancelled is one that may already have published: every merge to main publishes, so no run here is
+# ever superseded by a later one.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
