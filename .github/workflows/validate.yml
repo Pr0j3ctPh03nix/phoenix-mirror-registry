@@ -1,0 +1,83 @@
+name: validate
+
+# Pull request -> build the mirror list and check it, and SIGN NOTHING.
+#
+# Signing is the merge gate. A pull request that produced a signed artifact would let a
+# registration reach clients with the review still open — and this repo's whole reason to exist is
+# that the list a launcher PERSISTS is decided by a person, not by whoever opened a PR. So this
+# workflow never reads the signing secret, never checks out anything that could sign on its behalf,
+# and runs with `contents: read`. A fork's pull request gets no secrets at all, which makes that
+# guarantee structural as well as stated.
+#
+# NEVER interpolate `${{ }}` into a `run:` block. It is textual substitution performed before bash
+# parses the script, so a branch name authored by a PR is executable code. Nothing below needs it.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      # Third-party actions are pinned to COMMIT SHAs, not tags: a tag is mutable, so an action
+      # referenced by one is code that can change under a workflow that was reviewed once. The
+      # trailing comment is the human-readable version; update both together.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      # This workflow does not sign, so it needs none of these files to run. It checks them out
+      # anyway, because a PULL REQUEST is where the pin below gets bumped and reviewed — and the
+      # only thing that proves a pin is good is resolving it and looking at what came back. Without
+      # this, a bad SHA (a force-pushed branch, a typo, a revision predating seal.py) is discovered
+      # by the publish run on main, after the merge, with the list already unsignable.
+      #
+      # `ref` is a COMMIT SHA, never a branch: what seals a release must be an exact named
+      # revision, so a change in release-tooling can never silently alter this producer.
+      - name: Fetch release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          repository: Pr0j3ctPh03nix/phoenix-release-tooling
+          ref: 0e3ad70c6f7cf608ccef833107562b1c771394ad
+          path: .tooling
+
+      # Exactly what publish.yml reaches into release-tooling for, and nothing else — this repo
+      # authors its own document and takes only the sealing step from there. Kept identical to the
+      # list in publish.yml on purpose: a PR that would fail at seal time fails here instead.
+      - name: Preflight the pinned tooling
+        run: |
+          set -euo pipefail
+          for f in .tooling/tools/seal.py .tooling/tools/phoenix_minisign.py \
+                   .tooling/keys/phoenix-active.pub; do
+            test -f "$f" || { echo "$f is missing — check the release-tooling ref pinned above"; exit 1; }
+          done
+          echo "pinned tooling present"
+
+      # The generator's own rules, checked against each other. It has no dependencies, so this is
+      # the whole test suite and it runs before the registrations are read.
+      - name: Selftest the generator
+        run: python generate_mirror_list.py selftest
+
+      # Serial 0 deliberately: WHICH number a list carries is decided at publish time from what is
+      # actually published (see publish.yml), and a PR must not depend on — or appear to decide —
+      # the state of the release line. What is being checked here is the mirror SET.
+      - name: Build the list
+        run: |
+          set -euo pipefail
+          python generate_mirror_list.py build --serial 0 --out /tmp/mirrors.json
+          cat /tmp/mirrors.json
+
+      # Determinism is a promised property of the generator, so it is checked rather than asserted:
+      # the same registrations must render the same bytes, or "the diff in the published list is
+      # the diff in mirrors.d" stops being something a reviewer can rely on. The two ways it breaks
+      # are both silent — a directory read in the OS's order, and a timestamp taken from the clock.
+      - name: Rebuild and compare, byte for byte
+        run: |
+          set -euo pipefail
+          python generate_mirror_list.py build --serial 0 --out /tmp/mirrors.again.json
+          cmp /tmp/mirrors.json /tmp/mirrors.again.json
+          echo "byte-identical across two runs"
+
+      - name: Say plainly that nothing was signed
+        run: echo "VALIDATED — nothing signed, nothing published. Merging to main is what publishes."
