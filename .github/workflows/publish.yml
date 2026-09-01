@@ -53,6 +53,11 @@ on:
   # poor moment to find out the organisation secret was never shared here. Run it from the Actions
   # tab after the secret, the pinned tooling ref, or this file changes.
   workflow_dispatch:
+    inputs:
+      seed:
+        description: "Mint the FIRST serial. Only for a genuinely new line — see 'Compute the list serial'."
+        type: boolean
+        default: false
 
 permissions:
   contents: write        # create the Release
@@ -88,24 +93,21 @@ jobs:
       # never appears. Reading the published number cannot lose its place, because it holds no
       # state to lose.
       #
-      # THE SEED, which is where this differs from dist's identical-looking step. dist forbids a
-      # seed outright, because that line already has releases and "I could not read the last
-      # serial" can only ever mean something went wrong. This repo starts EMPTY, so a first publish
-      # is legitimate and must mint a number. The two cases are told apart by a question that has
-      # exactly one honest answer — "how many releases has this repo ever PUBLISHED?" — and never by
-      # a failure to read one:
+      # TWO RULES, and both exist because a serial that goes backwards fails SILENTLY: the list
+      # publishes green and every client holding the higher number refuses it, with nothing anywhere
+      # reporting a problem.
       #
-      #   0 published releases  -> nothing was ever visible to a client, so nothing holds a
-      #                            high-water mark for this payload. Seed, loudly.
-      #   >0 published releases -> the previous serial MUST be readable. A rate limit, a network
-      #                            blip, a latest release with no mirrors.json, a document whose
-      #                            .serial is not a number: each fails the run. Restarting at the
-      #                            seed here would publish a list every existing client refuses.
+      #   COUNT FROM THE HIGH-WATER MARK, not from the latest release. Those differ precisely when
+      #   the newest release was deleted — ordinary cleanup — after which `releases/latest` answers
+      #   with an OLDER one and the next serial lands at or below a number already handed out. The
+      #   tag IS the serial, so the mark is the largest `v<n>` this repo has ever carried, counting
+      #   drafts and prereleases too: a draft left by a failed publish still NAMED a number.
       #
-      # Only non-draft, non-prerelease releases are counted, because those are the only ones a
-      # client can see — and because a publish that failed between the draft and the undraft below
-      # leaves a draft behind. Counting that draft would close the seed path forever, with still
-      # nothing published to read a serial from.
+      #   NEVER SEED AUTOMATICALLY. "This line is new" and "somebody deleted the releases" look
+      #   identical from inside the job, and the second one restarting at 1 is exactly the silent
+      #   failure above. A push therefore refuses and explains; only a hand-run dispatch carrying
+      #   `seed = true` may mint the first number. This is where it differs from dist's otherwise
+      #   identical step, which forbids seeding outright because that line has always had releases.
       #
       # `set -o pipefail` and the integer test are what make "cannot read" fail instead of falling
       # through: gh exits non-zero on an API failure, and the pipeline must not swallow it. `gh`
@@ -115,16 +117,41 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           SEED: '1'
+          # Only a hand-run dispatch can carry this, so a push can never seed. See the refusal below.
+          SEED_OK: ${{ github.event.inputs.seed }}
         run: |
           set -euo pipefail
+          # The HIGHEST serial this line has ever named, across releases in ANY state — drafts and
+          # prereleases included. `releases/latest` alone was wrong in a way that only shows up
+          # afterwards: it is the newest by DATE, so deleting the newest release makes it answer with
+          # an OLDER one, and the next serial is computed from that — at or below a number already
+          # handed out, which every client that holds the higher one refuses forever.
+          #
+          # The tag IS the serial (`v<n>`, written by the publish step below), so this needs no
+          # asset downloads, and a draft left behind by a failed publish still counts: it named a
+          # number, and a number that was named must never be issued twice.
+          high=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[].tag_name' \
+                   | sed -n 's/^v\([0-9][0-9]*\)$/\1/p' | sort -n | tail -1)
           published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
                         --jq '.[] | select(.draft == false and .prerelease == false) | .id' | wc -l)
-          if [ "$published" -eq 0 ]; then
-            echo "no published release exists in $GITHUB_REPOSITORY — FIRST PUBLISH, seeding serial $SEED"
+          if [ -z "$high" ]; then
+            # SEEDING IS NEVER AUTOMATIC. "This line has no serial yet" and "somebody deleted the
+            # releases" look identical from here, and guessing wrong restarts numbering below every
+            # installed client's ratchet — a green publish nothing accepts, reporting nothing. So a
+            # push refuses and says how to do it deliberately; only a hand-run dispatch may seed.
+            if [ "$SEED_OK" != 'true' ]; then
+              echo "no release in $GITHUB_REPOSITORY names a serial."
+              echo "If this line is genuinely new, run this workflow from the Actions tab with"
+              echo "  seed = true  to mint serial $SEED deliberately."
+              echo "If it is NOT new, releases were deleted — seeding now would publish a list every"
+              echo "existing client refuses. Restore them, or seed above the highest serial ever used."
+              exit 1
+            fi
+            echo "SEEDING serial $SEED — asked for explicitly on a manual run"
             serial="$SEED"
             first=true
           else
-            echo "$published published release(s); the last serial must be readable"
+            echo "highest serial ever named: $high ($published published release(s))"
             # The asset's API url, not its browser url: the latter is unauthenticated and 404s on a
             # private repository.
             asset=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
@@ -137,9 +164,13 @@ jobs:
             gh api "$asset" -H "Accept: application/octet-stream" > "$RUNNER_TEMP/published.json"
             prev=$(jq -r '.serial' "$RUNNER_TEMP/published.json")
             case "$prev" in ''|*[!0-9]*) echo "published serial is not a number: '$prev'"; exit 1 ;; esac
-            serial=$(( prev + 1 ))
+            # Counted from the HIGH-WATER MARK, not from whatever the latest release happens to
+            # carry: those differ exactly when a newer release was deleted, which is the case this
+            # whole block exists to survive.
+            if [ "$prev" -gt "$high" ]; then high="$prev"; fi
+            serial=$(( high + 1 ))
             first=false
-            echo "published serial $prev -> this run would publish $serial"
+            echo "latest published serial $prev, high-water $high -> this run would publish $serial"
           fi
           echo "PHOENIX_SERIAL=$serial" >> "$GITHUB_ENV"
           # Told to the gate explicitly rather than inferred from whether the file above exists: the
