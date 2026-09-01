@@ -23,11 +23,24 @@ name: publish
 #     the document a client would then refuse and, worse, the interleaving that looks like an
 #     attack.
 #
-# EVERY push to main publishes; there is no `paths:` filter. A commit that cannot change the
-# document (a README fix) therefore mints a release identical but for its serial, which costs a
-# number and nothing else. A filter would trade that for the opposite failure — an input added
-# outside the filter, and a registration that is merged, green, and never published — and a silent
-# non-publish is the failure class this whole repo is built to refuse.
+# A push publishes ONLY IF THE DOCUMENT ACTUALLY CHANGED, and the reason is the signing key rather
+# than tidiness: every publish puts PHOENIX_SIGNING_KEY into a runner, so sealing a release because
+# somebody fixed a typo in the README is key exposure bought for nothing. Two README edits did
+# exactly that before this gate existed.
+#
+# The gate compares the freshly built document against the PUBLISHED one, ignoring `serial` and
+# `signed_at` (which differ on every run by construction and say nothing about the list). It is
+# deliberately NOT a `paths:` filter. A path list is a second, hand-maintained copy of "what the
+# document is made from" — `mirrors.d/` today, plus generate_mirror_list.py, plus whatever input
+# gets added next — and the day one is forgotten, a merged registration is green and silently never
+# published. That is the failure class this whole repo is built to refuse (see the generator's
+# docstring). Comparing the rendered document asks the only question that matters, and no future
+# input file can slip past it.
+#
+# Two rules keep the gate from becoming its own silent failure: a run that CANNOT tell whether the
+# document changed fails loudly rather than guessing in either direction, and `workflow_dispatch`
+# seals unconditionally, because proving the key and the pinned tooling still work is the entire
+# job of the dry run.
 #
 # NEVER interpolate `${{ }}` into a `run:` block. It is textual substitution performed before bash
 # parses the script, so anything from the event is executable code — and these steps hold the
@@ -49,8 +62,8 @@ permissions:
 # collides on the tag and fails, which is loud and re-runnable, but it fails AFTER sealing and after
 # creating a draft. Serialising the job makes the second run read the first one's published result,
 # which is the number it was always meant to read. `cancel-in-progress: false` because the run being
-# cancelled is one that may already have published: every merge to main publishes, so no run here is
-# ever superseded by a later one.
+# cancelled is one that may already have published — and a later run never supersedes an earlier one
+# here, since each publishes its own document rather than a newer view of one shared thing.
 concurrency:
   group: publish
   cancel-in-progress: false
@@ -109,6 +122,7 @@ jobs:
           if [ "$published" -eq 0 ]; then
             echo "no published release exists in $GITHUB_REPOSITORY — FIRST PUBLISH, seeding serial $SEED"
             serial="$SEED"
+            first=true
           else
             echo "$published published release(s); the last serial must be readable"
             # The asset's API url, not its browser url: the latter is unauthenticated and 404s on a
@@ -116,12 +130,22 @@ jobs:
             asset=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
                       --jq '.assets[] | select(.name == "mirrors.json") | .url')
             [ -n "$asset" ] || { echo "the latest release carries no mirrors.json"; exit 1; }
-            prev=$(gh api "$asset" -H "Accept: application/octet-stream" --jq '.serial')
+            # SAVED, not just read for its serial: the change gate below compares against this exact
+            # document, and fetching it twice would let the two reads disagree. It lands in
+            # RUNNER_TEMP rather than the workspace because the checkout in the next step wipes the
+            # workspace, and a file written here would go with it.
+            gh api "$asset" -H "Accept: application/octet-stream" > "$RUNNER_TEMP/published.json"
+            prev=$(jq -r '.serial' "$RUNNER_TEMP/published.json")
             case "$prev" in ''|*[!0-9]*) echo "published serial is not a number: '$prev'"; exit 1 ;; esac
             serial=$(( prev + 1 ))
-            echo "published serial $prev -> this run publishes $serial"
+            first=false
+            echo "published serial $prev -> this run would publish $serial"
           fi
           echo "PHOENIX_SERIAL=$serial" >> "$GITHUB_ENV"
+          # Told to the gate explicitly rather than inferred from whether the file above exists: the
+          # two questions ("was there anything published" and "did a download succeed") must not be
+          # answered by one test, which is the same confusion the seed path above exists to avoid.
+          echo "PHOENIX_FIRST_PUBLISH=$first" >> "$GITHUB_ENV"
 
       # Third-party actions are pinned to COMMIT SHAs, not tags. A tag is mutable, and every action
       # below runs in the same job as PHOENIX_SIGNING_KEY with `contents: write`. The trailing
@@ -145,13 +169,74 @@ jobs:
           ref: 0e3ad70c6f7cf608ccef833107562b1c771394ad
           path: .tooling
 
+      # The generator's own rules, checked against each other before its output is trusted — and
+      # before the gate below compares that output against anything. It needs no key, so it runs
+      # unconditionally: a broken generator should fail every run, not only the ones that publish.
+      - name: Selftest the generator
+        run: python generate_mirror_list.py selftest
+
+      # `--signed-at` is supplied HERE and nowhere else. The generator never reads the clock, which
+      # is what makes an unchanged mirrors.d render byte-identically; the run that knows a publish
+      # is happening is the one that can honestly stamp it. The field is advisory — no reader may
+      # fail on it — so it names the instant and carries no other meaning.
+      - name: Build the mirror list
+        run: |
+          set -euo pipefail
+          python generate_mirror_list.py build \
+            --serial     "$PHOENIX_SERIAL" \
+            --signed-at  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --out        mirrors.json
+          cat mirrors.json
+
+      # THE GATE, and it sits here for one reason: everything below can see PHOENIX_SIGNING_KEY, and
+      # nothing above it can. A push that changes no mirror therefore never puts the release key in
+      # this runner at all — which is the whole point, not a side effect of skipping work.
+      - name: Decide whether this run seals anything
+        run: |
+          set -euo pipefail
+          if [ "$PUBLISHING" != 'true' ]; then
+            echo "DRY RUN — sealing unconditionally: proving the key and the pinned tooling still work"
+            echo "is this run's entire job, so it must not be skipped for an unchanged list."
+            seal=true
+          elif [ "$PHOENIX_FIRST_PUBLISH" = 'true' ]; then
+            echo "FIRST PUBLISH — there is no published list to compare against."
+            seal=true
+          else
+            # The generator answers this, not a shell pipeline: WHICH fields carry meaning and which
+            # are bookkeeping is a fact about the format, and the module that emits them is the one
+            # that should own it — a second copy of that list here would be free to drift from the
+            # document it describes. It is covered by `selftest`, which a pipeline could not be.
+            #
+            # It exits non-zero on anything it could not read, so a truncated or malformed published
+            # document aborts the run under `set -e` instead of being quietly read as either answer:
+            # "I cannot tell" must never resolve to "unchanged" (a silent non-publish) or to
+            # "changed" (a signature nobody needed).
+            seal=$(python generate_mirror_list.py changed \
+                     --published "$RUNNER_TEMP/published.json" --candidate mirrors.json)
+            if [ "$seal" = 'true' ]; then
+              echo "the list changed — this run publishes serial $PHOENIX_SERIAL"
+              diff -u "$RUNNER_TEMP/published.json" mirrors.json || true
+            else
+              echo "the published list already says exactly this — nothing to sign, nothing to publish"
+            fi
+          fi
+          echo "PHOENIX_SEAL=$seal" >> "$GITHUB_ENV"
+
       # The only non-stdlib dependency in the whole run, and it belongs to the signer, not to this
       # repo: generate_mirror_list.py is stdlib-only by design.
       - name: Install the signing dependency
+        if: ${{ env.PHOENIX_SEAL == 'true' }}
         run: python -m pip install --disable-pip-version-check cryptography
 
-      # Everything that can refuse this publish, before anything is generated.
+      # Everything that can refuse this publish, before anything is sealed.
+      #
+      # It used to run before the document was built, on the principle that a gate should cost
+      # seconds rather than a build. Building is instant and needs no key, so the order now follows
+      # the stronger rule instead: no step that can see the signing key may run on a push that
+      # publishes nothing. The cost of that trade is that a missing secret is discovered by the next
+      # run that actually changes the list — which is what `workflow_dispatch` is for.
       - name: Preflight
+        if: ${{ env.PHOENIX_SEAL == 'true' }}
         env:
           PHOENIX_SIGNING_KEY: ${{ secrets.PHOENIX_SIGNING_KEY }}
         run: |
@@ -173,21 +258,6 @@ jobs:
             echo "secrets.PHOENIX_SIGNING_KEY is not set — refusing to publish an unsigned mirror list"
             exit 1
           }
-          # The generator's own rules, checked against each other before its output is trusted.
-          python generate_mirror_list.py selftest
-
-      # `--signed-at` is supplied HERE and nowhere else. The generator never reads the clock, which
-      # is what makes an unchanged mirrors.d render byte-identically; the run that knows a publish
-      # is happening is the one that can honestly stamp it. The field is advisory — no reader may
-      # fail on it — so it names the instant and carries no other meaning.
-      - name: Build the mirror list
-        run: |
-          set -euo pipefail
-          python generate_mirror_list.py build \
-            --serial     "$PHOENIX_SERIAL" \
-            --signed-at  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --out        mirrors.json
-          cat mirrors.json
 
       # Seal: sign the document's exact bytes, and prove the signature verifies against the public
       # half clients pin. One command, shared with every other payload — see .tooling/tools/seal.py
@@ -198,6 +268,7 @@ jobs:
       # raw bytes and knows nothing about what is in them, which is exactly why this format needed
       # no change there.
       - name: Seal the mirror list
+        if: ${{ env.PHOENIX_SEAL == 'true' }}
         env:
           PHOENIX_SIGNING_KEY: ${{ secrets.PHOENIX_SIGNING_KEY }}
         run: |
@@ -211,6 +282,7 @@ jobs:
       # The body quotes the document in full: it is small, and a reviewer reading the Release sees
       # the exact bytes that were signed rather than a description of them.
       - name: Compose the release body
+        if: ${{ env.PHOENIX_SEAL == 'true' }}
         run: |
           set -euo pipefail
           {
@@ -227,7 +299,7 @@ jobs:
       # half-uploaded list nor closes the seed path. `fail_on_unmatched_files` turns a missing
       # signature into a failed run rather than a release nobody can verify.
       - name: Publish Release (draft)
-        if: ${{ env.PUBLISHING == 'true' }}
+        if: ${{ env.PUBLISHING == 'true' && env.PHOENIX_SEAL == 'true' }}
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
         with:
           tag_name: v${{ env.PHOENIX_SERIAL }}
@@ -243,7 +315,7 @@ jobs:
       # leaves a draft behind — visible to us, invisible to every client — instead of a permanently
       # half-published list.
       - name: Undraft the Release
-        if: ${{ env.PUBLISHING == 'true' }}
+        if: ${{ env.PUBLISHING == 'true' && env.PHOENIX_SEAL == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "v$PHOENIX_SERIAL" --draft=false
@@ -255,3 +327,13 @@ jobs:
           echo "DRY RUN — sealed and verified as serial $PHOENIX_SERIAL, nothing published."
           echo "The signing secret, the pinned tooling and the whole producer chain all work."
           ls -l mirrors.json mirrors.json.minisig
+
+      # The other green ending, said just as plainly. A skipped publish and a broken one both leave
+      # no new release, so the run has to state which it was — otherwise the only way to tell a
+      # working gate from a silently failing publisher is to go reading step logs.
+      - name: Nothing to publish
+        if: ${{ env.PUBLISHING == 'true' && env.PHOENIX_SEAL != 'true' }}
+        run: |
+          echo "NOTHING PUBLISHED — the mirror list is byte-for-byte what serial"
+          echo "$(( PHOENIX_SERIAL - 1 )) already says, so this push changed no mirror."
+          echo "No signature was made and the release key never entered this runner."

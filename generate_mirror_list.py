@@ -309,6 +309,44 @@ def write(path, text):
         fh.write(text)
 
 
+# --- has anything actually changed? ---------------------------------------------------------------
+
+# The two fields that differ on EVERY publish by construction and say nothing about the list:
+# `serial` rises once per publish, and `signed_at` is the clock. Comparing documents without
+# excluding them would report "changed" always, which is the same as not comparing at all.
+VOLATILE = ("serial", "signed_at")
+
+
+def differs(published, candidate):
+    """Do these two mirror lists say anything different?
+
+    The question the publish workflow asks before it seals: every publish puts the release signing
+    key into a CI runner, so a push that changes no mirror must not sign anything. Getting this
+    wrong is expensive in one direction and merely wasteful in the other -- a false "unchanged" is a
+    registration that merged green and silently never shipped, which is the failure this whole
+    module exists to refuse -- so the caller treats "I could not tell" as neither answer and fails.
+
+    It lives HERE, beside the renderer, because it is a fact about the FORMAT: which fields carry
+    meaning and which are bookkeeping is the same knowledge `build` uses to emit them. A copy of
+    that list in a shell pipeline would be free to drift from the document it describes.
+
+    `mirrors` order is significant and deliberately so: `build` sorts by name, so the order is a
+    function of the content -- two orderings mean two different published documents.
+    """
+    strip = lambda d: {k: v for k, v in d.items() if k not in VOLATILE}   # noqa: E731
+    return strip(published) != strip(candidate)
+
+
+def load_json(path):
+    """A document to compare, read strictly. Malformed is an ERROR, never "assume it changed": the
+    caller must be able to tell "these differ" from "I could not read one of them"."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as e:
+        raise MirrorListError(f"{path}: not readable as a mirror list: {e}") from None
+
+
 # --- selftest -----------------------------------------------------------------------------------
 
 DEFAULT_DIR = "mirrors.d"
@@ -430,6 +468,32 @@ def _selftest():
     refused("a serial that is a string", lambda: build([entry()], "1"))
     refused("a malformed signed_at", lambda: build([entry()], 1, "2026-09-01 11:00"))
 
+    # --- has anything actually changed? the question that decides whether CI signs at all, so a
+    #     false "no" is a registration that merged green and never shipped
+    ok("the same list is unchanged",
+       lambda: assert_(not differs(build([entry()], 1), build([entry()], 1)), "reported a change"))
+    ok("a rising serial alone is not a change",
+       lambda: assert_(not differs(build([entry()], 1), build([entry()], 99)), "the serial leaked"))
+    ok("a different signed_at alone is not a change",
+       lambda: assert_(not differs(build([entry()], 1, "2026-01-01T00:00:00Z"),
+                                   build([entry()], 2, "2026-09-09T09:09:09Z")),
+                       "the clock leaked into the comparison"))
+    ok("signed_at present vs absent is not a change",
+       lambda: assert_(not differs(build([entry()], 1), build([entry()], 1, "2026-09-01T11:00:00Z")),
+                       "an absent advisory field read as a change"))
+    ok("adding a mirror IS a change",
+       lambda: assert_(differs(build([entry()], 1), build([entry(), other()], 1)),
+                       "a new mirror would never have been published"))
+    ok("removing a mirror IS a change",
+       lambda: assert_(differs(build([entry(), other()], 1), build([entry()], 1)),
+                       "a retired mirror would never have been withdrawn"))
+    ok("changing one field of one mirror IS a change",
+       lambda: assert_(differs(build([entry()], 1), build([entry(country="SE")], 1)),
+                       "an edited registration would never have shipped"))
+    ok("a different payload set IS a change",
+       lambda: assert_(differs(build([entry()], 1), build([entry(payloads=["mod"])], 1)),
+                       "a mirror that dropped a payload would still be advertised for it"))
+
     # --- the directory, which needs real files
     with tempfile.TemporaryDirectory() as tmp:
         def put(fname, text):
@@ -511,11 +575,26 @@ def main():
     b.add_argument("--signed-at", help="advisory publish instant, e.g. 2026-09-01T11:00:00Z; "
                                        "omitted from the document when not given")
 
+    c = sub.add_parser("changed", help="does a candidate list differ from the published one?")
+    c.add_argument("--published", required=True, help="the currently published mirrors.json")
+    c.add_argument("--candidate", required=True, help="the freshly built one")
+
     sub.add_parser("selftest", help="check the refusal rules against each other")
     a = ap.parse_args()
 
     if a.cmd == "selftest":
         sys.exit(1 if _selftest() else 0)
+
+    if a.cmd == "changed":
+        # Prints `true`/`false` for a shell to capture, and EXITS NON-ZERO on anything it could not
+        # read. A caller must be able to tell the two apart: an exit code alone would make "they are
+        # the same" and "I could not tell" the same event, and one of those must never be believed.
+        try:
+            verdict = differs(load_json(a.published), load_json(a.candidate))
+        except MirrorListError as e:
+            die(str(e))
+        print("true" if verdict else "false")
+        return
 
     try:
         doc = build(load_dir(a.mirrors_dir), a.serial, a.signed_at)
