@@ -1,0 +1,6 @@
+{
+  "base_url": "https://fi1.mirror.projectphoenix.example",
+  "name": "phx-fi-1",
+  "country": "FI",
+  "payloads": ["mod", "launcher", "game"]
+}

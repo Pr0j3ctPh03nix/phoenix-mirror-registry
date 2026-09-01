@@ -1,0 +1,13 @@
+# No PRIVATE key ever belongs in this repo. The release key reaches CI as an organisation secret
+# read straight from the environment (release-tooling's seal.py --key-env), so there is no keyfile
+# to commit by accident — and this is the net under that rule, not the rule itself.
+*.key
+
+# Build outputs. mirrors.json is GENERATED from mirrors.d/ at publish time and only ever exists as
+# a release asset; a copy committed here would be a second answer to "what is published", free to
+# disagree with the signed one.
+/mirrors.json
+/mirrors.json.minisig
+
+# Bytecode from running the selftest.
+__pycache__/
