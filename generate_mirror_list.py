@@ -113,13 +113,16 @@ def check_base_url(url):
             f"base_url must be plain ASCII with no whitespace: {url!r}\n"
             "  Everything downstream appends a path to this string and hands it to an HTTP client; "
             "an internationalised host has to be punycoded before it is published, not after.")
-    # HTTPS only. This is STRICTER than the launcher, which accepts http:// as well -- it is a
-    # publishing decision, not a client limit: a plaintext mirror lets any middlebox on the path
-    # choose which release a client sees. The signature would still catch a tampered payload, so
-    # the attack this closes is the denial one -- and on the networks mirrors exist for, that is
-    # the likely one.
-    if not url.startswith("https://"):
-        raise MirrorListError(f"base_url must start with https:// : {url!r}")
+    # Exactly the two schemes the launcher accepts, and a mirror may be plain HTTP on any port.
+    # Nothing about trust rides on the transport: a payload is believed because of the signature
+    # over it and the hash its manifest names, and an older one replayed at a client is refused by
+    # the serial ratchet. So the most a middlebox on a plaintext hop can do is deny service, which
+    # is the same thing a mirror that simply stops answering does -- the failure a LIST of mirrors
+    # exists to absorb. Requiring TLS would only turn away hosts serving those same bytes.
+    # The rule is stated here rather than left to the canonical test below, because that one would
+    # refuse an ftp:// or scheme-less URL as "empty after its scheme" and name the wrong problem.
+    if not url.startswith(("http://", "https://")):
+        raise MirrorListError(f"base_url must start with http:// or https:// : {url!r}")
     # The FIXED POINT test. Anything the launcher would strip -- surrounding whitespace, a trailing
     # slash -- must already be gone, or the published string and the string the client actually uses
     # are two different things.
@@ -424,8 +427,12 @@ def _selftest():
     ok("the launcher's canonical form agrees on a good URL",
        lambda: assert_(launcher_canonical("https://mirror.example") == "https://mirror.example",
                        "canonical form disagrees"))
-    refused("http:// — stricter here than in the launcher, deliberately",
-            lambda: build([entry(base_url="http://mirror.example")], 1))
+    ok("http:// — the same two schemes the launcher accepts, transport being no part of trust",
+       lambda: build([entry(base_url="http://mirror.example")], 1))
+    ok("a port, which no rule here has an opinion about",
+       lambda: build([entry(base_url="http://mirror.example:8080")], 1))
+    refused("a scheme that is neither http nor https",
+            lambda: build([entry(base_url="ftp://mirror.example")], 1))
     refused("a trailing slash, which the launcher would strip",
             lambda: build([entry(base_url="https://mirror.example/")], 1))
     refused("surrounding whitespace, which the launcher would trim",
