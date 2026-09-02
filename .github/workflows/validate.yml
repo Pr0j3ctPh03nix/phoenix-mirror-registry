@@ -39,17 +39,24 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: Pr0j3ctPh03nix/phoenix-release-tooling
-          ref: 0e3ad70c6f7cf608ccef833107562b1c771394ad
+          ref: 372fbace82ac673335350b59333ef7299469420d
           path: .tooling
 
-      # Exactly what publish.yml reaches into release-tooling for, and nothing else — this repo
-      # authors its own document and takes only the sealing step from there. Kept identical to the
-      # list in publish.yml on purpose: a PR that would fail at seal time fails here instead.
+      # Everything publish.yml reaches into release-tooling for — this repo authors its own document
+      # and takes only the sealing step from there. The point is that a PR which would fail at seal
+      # time fails here instead, so the list follows what publish.yml USES rather than what this
+      # workflow needs (it needs none of it).
+      #
+      # wheels/ is on the list and is not in publish.yml's own preflight, which is not a drift:
+      # publish.yml installs from it several steps EARLIER than its preflight runs, so a missing
+      # wheels/ already fails it there and a second check could never fire. Here nothing installs,
+      # and a pin that predates the vendored wheels would otherwise be discovered on main, after the
+      # merge, with the list already unsignable.
       - name: Preflight the pinned tooling
         run: |
           set -euo pipefail
           for f in .tooling/tools/seal.py .tooling/tools/phoenix_minisign.py \
-                   .tooling/keys/phoenix-active.pub; do
+                   .tooling/keys/phoenix-active.pub .tooling/wheels/SHA256SUMS; do
             test -f "$f" || { echo "$f is missing — check the release-tooling ref pinned above"; exit 1; }
           done
           echo "pinned tooling present"
