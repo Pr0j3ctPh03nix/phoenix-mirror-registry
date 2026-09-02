@@ -255,9 +255,20 @@ jobs:
 
       # The only non-stdlib dependency in the whole run, and it belongs to the signer, not to this
       # repo: generate_mirror_list.py is stdlib-only by design.
+      #
+      # Pinned by CONTENT HASH, on the same principle as the action SHAs above: this step runs in
+      # the job that holds PHOENIX_SIGNING_KEY, and `cryptography` is the code the key is handed
+      # to. A bare name — or a `==` version — still trusts the index to answer with the bytes it
+      # answered with yesterday; a swapped artifact during the run would run inside the seal step
+      # with the key in its environment. `--require-hashes` makes pip refuse any file whose digest
+      # is not listed, and any dependency that has no entry at all, which is why the signer's
+      # transitive closure (cffi, pycparser) is listed with it. The hashes name the wheels the
+      # ubuntu-latest image's Python selects; a new image Python fails here with a mismatch —
+      # loud, and before the key is read — rather than installing something unlisted. How to
+      # regenerate is on the file itself.
       - name: Install the signing dependency
         if: ${{ env.PHOENIX_SEAL == 'true' }}
-        run: python -m pip install --disable-pip-version-check cryptography
+        run: python -m pip install --disable-pip-version-check --require-hashes -r .github/signing-requirements.txt
 
       # Everything that can refuse this publish, before anything is sealed.
       #
