@@ -51,7 +51,9 @@ jobs:
       # publish.yml installs from it several steps EARLIER than its preflight runs, so a missing
       # wheels/ already fails it there and a second check could never fire. Here nothing installs,
       # and a pin that predates the vendored wheels would otherwise be discovered on main, after the
-      # merge, with the list already unsignable.
+      # merge, with the list already unsignable. It stays in the `test -f` loop as well as under
+      # wheels_check below, because only the loop names the cause a reviewer of THIS pull request can
+      # act on — the ref pinned above — where wheels_check would suggest regenerating the file.
       - name: Preflight the pinned tooling
         run: |
           set -euo pipefail
@@ -60,6 +62,10 @@ jobs:
             test -f "$f" || { echo "$f is missing — check the release-tooling ref pinned above"; exit 1; }
           done
           echo "pinned tooling present"
+          # Presence is not enough for the wheels: they are the code the release key is handed to on
+          # main, and this is the last look at the pin before that happens. wheels_check re-hashes
+          # each one against wheels/SHA256SUMS with no network, so it proves as much here as there.
+          python .tooling/tools/wheels_check.py check
 
       # The generator's own rules, checked against each other. It has no dependencies, so this is
       # the whole test suite and it runs before the registrations are read.
