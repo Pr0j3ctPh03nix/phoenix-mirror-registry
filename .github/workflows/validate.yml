@@ -72,6 +72,14 @@ jobs:
       - name: Selftest the generator
         run: python generate_mirror_list.py selftest
 
+      # The registration helper is checked here too, and it can be for the same reason the generator
+      # can: stdlib only, and its two outside edges — the network and git — are each behind one
+      # function that its selftest replaces. So it installs nothing, reaches nothing, and needs no
+      # git identity on the runner. It writes most registrations in this directory, which makes it a
+      # producer of the very files the steps below refuse to publish when they are wrong.
+      - name: Selftest the register helper
+        run: python register_mirror.py selftest
+
       # Serial 0 deliberately: WHICH number a list carries is decided at publish time from what is
       # actually published (see publish.yml), and a PR must not depend on — or appear to decide —
       # the state of the release line. What is being checked here is the mirror SET.
