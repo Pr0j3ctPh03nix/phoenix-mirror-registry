@@ -89,8 +89,8 @@ def canonical_base_url(url):
     right: a `mirrors.d` entry must ALREADY be canonical (the published string is what every future
     reader receives), while a URL typed at a shell may reasonably carry the trailing slash a browser
     put there. So this passes the argument through the launcher's own canonical form first, then
-    through the generator's check -- which is what refuses http://, non-ASCII and an empty host with
-    the generator's own message.
+    through the generator's check -- which is what refuses a scheme that is neither http nor https,
+    non-ASCII and an empty host with the generator's own message.
     """
     if not isinstance(url, str):
         raise RegisterError(f"a base URL must be a string, not {type(url).__name__}")
@@ -110,17 +110,18 @@ def http_get(url, timeout=TIMEOUT, cap=MAX_BODY):
     caller, and reading one byte past the limit is what lets "too large" be told from "exactly the
     limit" without ever holding more than that.
 
-    TLS IS VERIFIED, by urllib's default context, and there is deliberately no flag to turn that
-    off. A mirror on a bare IP is not the exception it looks like -- a certificate with an IP SAN
-    verifies normally -- and the one situation an insecure flag would help with, a host whose
-    certificate does not match the URL being registered, is precisely a host that must not be
-    published under that URL.
+    HTTP AND HTTPS, nothing else: the registry publishes both, so this fetches both, and which one
+    a host is asked over is simply the URL its operator typed. When that URL is https TLS IS
+    VERIFIED, by urllib's default context, with deliberately no flag to turn it off -- a host whose
+    certificate does not match the URL being registered is precisely one that must not be published
+    under that URL, and a host that would rather present no certificate at all can say so by
+    serving http:// and registering that.
     """
     # This function is reached only through `canonical_base_url`, but it holds the scheme rule
     # itself: it is the seam every future caller will reach for, and `urlopen` will happily open a
     # file:// or ftp:// URL that got this far.
-    if not url.startswith("https://"):
-        raise RegisterError(f"refusing to fetch a non-https URL: {url!r}")
+    if not url.startswith(("http://", "https://")):
+        raise RegisterError(f"refusing to fetch a URL that is neither http nor https: {url!r}")
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as res:
@@ -146,11 +147,14 @@ def entry_from_host(base_url):
 
     if status != 200:
         raise RegisterError(f"{url} answered HTTP {status}, not 200")
-    # urllib follows redirects, and https -> http is one it will follow. The published entry names
-    # ONE URL, so a hop that changed the scheme -- or the host -- has to be visible rather than
-    # silently registered under the address that was typed.
-    if not final_url.startswith("https://"):
-        raise RegisterError(f"{url} redirected to a non-https URL: {final_url!r}")
+    # urllib follows redirects, including ones that change the scheme. https -> http is fine here:
+    # the transport is not what makes the fetched entry believable, every check below it is, and
+    # the entry still has to name the URL that was TYPED (bottom of this function), so no redirect
+    # can change what ends up published. A hop off http(s) entirely is another matter -- urllib
+    # would follow one to ftp://, and that is not a thing to read a registration out of.
+    if not final_url.startswith(("http://", "https://")):
+        raise RegisterError(
+            f"{url} redirected to a URL that is neither http nor https: {final_url!r}")
     if len(body) > MAX_BODY:
         raise RegisterError(
             f"{url} answered with more than {MAX_BODY} bytes\n"
@@ -422,6 +426,7 @@ def _selftest():
             raise AssertionError(why)
 
     BASE = "https://mirror.example"
+    HTTP_BASE = "http://mirror.example"
 
     def entry(**over):
         e = {"base_url": BASE, "name": "phx-fi-1", "country": "FI",
@@ -461,8 +466,11 @@ def _selftest():
        lambda: assert_(canonical_base_url("https://mirror.example///") == BASE, "not stripped"))
     ok("an already-canonical URL is unchanged",
        lambda: assert_(canonical_base_url(BASE) == BASE, "canonical form is not a fixed point"))
-    refused("http://, with the generator's own reason",
-            lambda: canonical_base_url("http://mirror.example"), saying="must start with https://")
+    ok("an http:// URL is canonicalised like any other",
+       lambda: assert_(canonical_base_url("http://mirror.example/") == HTTP_BASE, "not normalised"))
+    refused("a scheme that is neither http nor https, with the generator's own reason",
+            lambda: canonical_base_url("ftp://mirror.example"),
+            saying="must start with http:// or https://")
     refused("a URL with no scheme", lambda: canonical_base_url("mirror.example"))
     refused("a scheme with nothing after it", lambda: canonical_base_url("https://"))
     refused("a host that was never punycoded",
@@ -471,6 +479,11 @@ def _selftest():
     # --- the fetch, with the network replaced
     ok("a host serving its own entry registers",
        lambda: assert_(fetch(serves(entry()))["name"] == "phx-fi-1", "the entry did not come back"))
+    ok("a plain-http host is fetched and registers the same way",
+       lambda: assert_(fetch(serves(entry(base_url=HTTP_BASE)), url=HTTP_BASE)["base_url"]
+                       == HTTP_BASE, "the entry did not come back"))
+    refused("a URL http_get must never open, checked at the seam itself",
+            lambda: http_get("file:///etc/passwd"), saying="neither http nor https")
     refused("a body over the cap", lambda: fetch(serving(b"x" * (MAX_BODY + 1))),
             saying="more than")
 
@@ -483,9 +496,12 @@ def _selftest():
 
     ok("a body of exactly the cap is accepted — the refusal is at cap + 1", at_cap)
     refused("a non-200 answer", lambda: fetch(serves(entry(), status=204)), saying="not 200")
-    refused("a redirect that dropped TLS",
-            lambda: fetch(serves(entry(), final="http://mirror.example/register.json")),
-            saying="non-https")
+    ok("a redirect that dropped TLS — the entry still has to name the URL that was typed",
+       lambda: assert_(fetch(serves(entry(), final="http://mirror.example/register.json"))
+                       ["base_url"] == BASE, "the entry did not come back"))
+    refused("a redirect off http(s) entirely",
+            lambda: fetch(serves(entry(), final="ftp://mirror.example/register.json")),
+            saying="neither http nor https")
     refused("a body that is not UTF-8", lambda: fetch(serving(b'{"name": "\xff"}')),
             saying="UTF-8")
     refused("a body that is not JSON", lambda: fetch(serving(b"<html>404</html>")),
@@ -666,7 +682,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     # One positional, not a subcommand tree: the whole interface is a mirror's URL. `selftest` is
     # spelled as a value rather than a subparser because it cannot be confused with one -- a base
-    # URL must start with https://.
+    # URL must start with http:// or https://.
     ap.add_argument("base_url", metavar="BASE_URL",
                     help="the mirror's base URL, e.g. https://mirror.example — its entry is read "
                          f"from <BASE_URL>/{REGISTER_PATH}. Or the literal `selftest`.")
