@@ -41,8 +41,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: Pr0j3ctPh03nix/phoenix-release-tooling
-          # PLACEHOLDER — keep in step with publish.yml's pin; see the note there.
-          ref: TOOLING_SHA_TBD
+          ref: 0eb43683fc0969902a4ead9e9ef05c16979b1c90
           path: .tooling
 
       # Everything publish.yml reaches into release-tooling for — this repo authors its own document

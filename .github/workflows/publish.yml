@@ -48,8 +48,10 @@ name: publish
 # input file can slip past it.
 #
 # Two rules keep the gate from becoming its own silent failure: a run that CANNOT tell whether the
-# document changed fails loudly rather than guessing in either direction, and `workflow_dispatch`
-# goes through the motions unconditionally, because rehearsing them is the entire job of the dry run.
+# document changed fails loudly rather than guessing in either direction, and a dry run goes through
+# the motions unconditionally, because rehearsing them is its entire job. A seeding run needs no
+# special case here — it has nothing published to compare against, so the gate's first-publish arm
+# already lets it through.
 #
 # NEVER interpolate `${{ }}` into a `run:` block. It is textual substitution performed before bash
 # parses the script, so anything from the event is executable code — and one of these steps holds
@@ -57,17 +59,26 @@ name: publish
 on:
   push:
     branches: [main]
-  # DRY RUN. Everything up to the request, then stop — nothing is dispatched and nothing is
-  # published. NOTHING IS DISPATCHED is the deliberate part: a dispatch spends a serial, so a
-  # rehearsal that asked for a signature would burn a number every time it ran. What it proves
-  # instead is everything on this side of the request — the pinned tooling, the vendored wheels, the
-  # serial rule against both its sources, the document, and the one honest thing a rehearsal can say
-  # about the transport: that the dispatch token is set. Run it from the Actions tab after the
-  # token, the pinned tooling ref, or this file changes.
+  # A HAND-RUN COMES IN TWO KINDS, and the input below is what chooses between them.
+  #
+  #   seed = false — DRY RUN. Everything up to the request, then stop: nothing is dispatched and
+  #     nothing is published. NOTHING IS DISPATCHED is the deliberate part — a dispatch spends a
+  #     serial, so a rehearsal that asked for a signature would burn a number every time it ran.
+  #     What it proves is everything on this side of the request: the pinned tooling, the vendored
+  #     wheels, the serial rule against both its sources, the document, and the one honest thing a
+  #     rehearsal can say about the transport, that the dispatch token is set. Run it after the
+  #     token, the pinned tooling ref, or this file changes.
+  #
+  #   seed = true — A REAL PUBLISH, asked for by hand: dispatch, wait, verify, upload, undraft, the
+  #     same as a push. It is not a rehearsal in any sense and it spends a serial. This is the ONLY
+  #     way to start a new line, because a push refuses to mint the first one (see 'Compute the
+  #     list serial') — without it the first list could never be published at all. On a line that
+  #     already has a serial nothing is "seeded": the run simply publishes the next number the way
+  #     a push would, subject to the same change gate.
   workflow_dispatch:
     inputs:
       seed:
-        description: "Mint the FIRST serial. Only for a genuinely new line — see 'Compute the list serial'."
+        description: "PUBLISH for real from this manual run, minting the first serial on a new line. Off = rehearse only, dispatch nothing."
         type: boolean
         default: false
 
@@ -91,9 +102,11 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     env:
-      # A dry run stops before anything is dispatched or published, so the steps that do either key
-      # off this one value rather than each re-deriving what kind of run this is.
-      PUBLISHING: ${{ github.event_name == 'push' }}
+      # Does this run publish? A push does, and so does a hand-run `seed = true` — the only way to
+      # mint a line's first serial, and a deliberate act by construction. A plain manual run does
+      # not, and dispatches nothing (see the `on:` block above). Every step that dispatches or
+      # publishes keys off this one value rather than re-deriving what kind of run this is.
+      PUBLISHING: ${{ github.event_name == 'push' || github.event.inputs.seed == 'true' }}
       # The authority's answer, and its ledger: one world-readable branch of release-tooling carrying
       # `sealed/<owner>/<name>/<tag>/`. Read twice below — once to pick a serial no seal has already
       # spent, once to collect this list's signature.
@@ -123,9 +136,7 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: Pr0j3ctPh03nix/phoenix-release-tooling
-          # PLACEHOLDER — replace with the release-tooling commit that carries the seal.yml this
-          # file talks to (workflow_dispatch, with this repository in its authorization map).
-          ref: TOOLING_SHA_TBD
+          ref: 0eb43683fc0969902a4ead9e9ef05c16979b1c90
           path: .tooling
 
       # Everything that can refuse this publish, before anything is read, generated or asked for.
@@ -198,11 +209,13 @@ jobs:
       # NEVER SEED AUTOMATICALLY. "This line is new" and "somebody deleted the releases" look
       # identical from inside the job, and the second one restarting at 1 is a green publish every
       # client refuses, reporting nothing. A push therefore refuses and explains; only a hand-run
-      # dispatch carrying `seed = true` may mint the first number. Central sealing narrows this a
-      # long way without removing it — deleted releases no longer look like a new line, because the
-      # ledger still remembers — so what is left is the case where BOTH are empty, which is genuinely
-      # ambiguous. (Serial 1 is the floor: the authority's ratchet is strictly-greater and its ping
-      # format refuses 0, so no payload can ever be sealed at 0.)
+      # dispatch carrying `seed = true` may mint the first number — and that run PUBLISHES it, which
+      # is the whole point: a refusal a human can only answer with a rehearsal would leave a new line
+      # with no way to be started at all. Central sealing narrows this a long way without removing
+      # it — deleted releases no longer look like a new line, because the ledger still remembers —
+      # so what is left is the case where BOTH are empty, which is genuinely ambiguous. (Serial 1 is
+      # the floor: the authority's ratchet is strictly-greater and its ping format refuses 0, so no
+      # payload can ever be sealed at 0.)
       #
       # `set -o pipefail` and the integer tests are what make "cannot read" fail instead of falling
       # through: gh exits non-zero on an API failure, and the pipeline must not swallow it. A MISSING
@@ -256,16 +269,23 @@ jobs:
               echo "nothing has ever been sealed for payload 'mirrors', and $GITHUB_REPOSITORY has"
               echo "published no release."
               echo "If this line is genuinely new, run this workflow from the Actions tab with"
-              echo "  seed = true  to mint serial $SEED deliberately."
+              echo "  seed = true  to mint serial $SEED deliberately. That run publishes for real."
               echo "If it is NOT new, the releases AND the ledger were lost — seeding now would ask"
               echo "for a serial every existing client refuses. Restore them, or seed above the"
               echo "highest serial ever used."
               exit 1
             fi
-            echo "SEEDING serial $SEED — asked for explicitly on a manual run"
+            echo "SEEDING serial $SEED — asked for explicitly on a manual run, and publishing it"
             serial="$SEED"
             first=true
           else
+            # `seed` on a line that already has a number seeds nothing; it is a publish asked for by
+            # hand, and it takes the same serial and the same change gate a push would. Said out
+            # loud, because the input's name would otherwise suggest something was minted.
+            if [ "$SEED_OK" = 'true' ]; then
+              echo "seed = true on a line that already has a serial — nothing to mint; this run"
+              echo "publishes the next number exactly as a push would."
+            fi
             prev=0
             first=true
             if [ "$published_count" -gt 0 ]; then
@@ -317,11 +337,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$PUBLISHING" != 'true' ]; then
-            echo "DRY RUN — going through the motions unconditionally: rehearsing the pinned"
-            echo "tooling, the wheels and the document is this run's entire job, so it must not be"
-            echo "skipped for an unchanged list. Nothing is dispatched either way."
+            echo "DRY RUN (seed = false) — going through the motions unconditionally: rehearsing"
+            echo "the pinned tooling, the wheels and the document is this run's entire job, so it"
+            echo "must not be skipped for an unchanged list. Nothing is dispatched either way."
             seal=true
           elif [ "$PHOENIX_FIRST_PUBLISH" = 'true' ]; then
+            # A seeding run lands here too, and must: there is nothing published to compare a first
+            # list against, so it publishes unconditionally.
             echo "FIRST PUBLISH — there is no published list to compare against."
             seal=true
           else
@@ -572,7 +594,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "v$PHOENIX_SERIAL" --draft=false
 
-      # Says plainly that nothing shipped, so a green dry run is never mistaken for a publish.
+      # Says plainly that nothing shipped, so a green dry run is never mistaken for a publish — and
+      # names the one thing that turns this run into a real one, since a rehearsal that cannot say
+      # how to publish is how a new line stays unpublished.
       - name: Dry run summary
         if: ${{ env.PUBLISHING != 'true' }}
         run: |
@@ -580,9 +604,11 @@ jobs:
           echo "Exercised: the pinned tooling, the vendored wheels, the dispatch token's presence,"
           echo "the serial rule against both the ledger and the published release, and the document."
           echo "NOT exercised: the request, the signature and everything after it. A dispatch spends"
-          echo "a serial — the authority ratchets the number whether or not anything ships — so only"
-          echo "a push may ask for one. This includes a seed run: it mints no serial, it only shows"
-          echo "which number a push would ask for."
+          echo "a serial — the authority ratchets the number whether or not anything ships — so a"
+          echo "rehearsal must never ask for one."
+          echo "To publish from a manual run, run this workflow again with seed = true. That is a"
+          echo "REAL publish — dispatch, wait, verify, upload, undraft — and on a line with no serial"
+          echo "yet it mints the first one."
           ls -l mirrors.json
 
       # The other green ending, said just as plainly. A skipped publish and a broken one both leave
@@ -592,6 +618,6 @@ jobs:
         if: ${{ env.PUBLISHING == 'true' && env.PHOENIX_SEAL != 'true' }}
         run: |
           echo "NOTHING PUBLISHED — the mirror list is byte-for-byte what the currently published"
-          echo "release already says, so this push changed no mirror. No signature was asked for,"
+          echo "release already says, so this run changed no mirror. No signature was asked for,"
           echo "and serial $PHOENIX_SERIAL was not spent: the next run that does change the list"
           echo "will ask for it."
