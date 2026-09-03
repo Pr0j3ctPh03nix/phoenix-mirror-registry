@@ -1,13 +1,19 @@
 name: publish
 
-# Push to main -> build the mirror list, seal it with the release key, publish it as a Release.
+# Push to main -> build the mirror list, have the signing authority seal it, publish it as a Release.
 #
-# The launcher PERSISTS this document: a published list replaces a client's mirror set wholesale,
-# so an unsigned one means a single hostile answer permanently rewrites where that machine fetches
+# THE SIGNING KEY HAS LEFT THIS REPOSITORY. It lives in exactly one place — phoenix-release-tooling,
+# pinned below — whose seal.yml signs on request and publishes both the signature and the serial
+# record to its world-readable `sealed` branch. All this workflow holds is a dispatch token that can
+# ask for a signature and nothing else. `.tooling/docs/sealing.md` is the producer-facing contract
+# this file implements — read it before changing anything here.
+#
+# The launcher PERSISTS this document: a published list replaces a client's mirror set wholesale, so
+# an unsigned one means a single hostile answer permanently rewrites where that machine fetches
 # every future release from. The signature is what makes the list worth obeying, and it is the same
-# Ed25519 release key every payload is sealed with, through the same one command
-# (.tooling/tools/seal.py) — the mod in dist's CI, the launcher in its own, the base game by hand,
-# and this. Only the producer differs.
+# Ed25519 release key every payload is sealed with, made by the same one authority — the mod and the
+# launcher ask for it from their own CI, this list asks for it from here, and only the base game is
+# still signed by hand, offline. Only the producer differs.
 #
 # There is no build-provenance attestation here, unlike dist's release workflow. Provenance exists
 # to tie a compiled binary nobody can reproduce to the workflow that built it; this artifact is a
@@ -15,18 +21,22 @@ name: publish
 # the reader actually checks.
 #
 # STEP ORDER IS LOAD-BEARING, twice over:
-#   * every gate that can fail runs BEFORE anything is generated or sealed — a missing secret or a
-#     bad tooling pin costs seconds;
+#   * every gate that can fail runs BEFORE anything is generated or asked for — an unset dispatch
+#     token or a bad tooling pin costs seconds (see the Preflight, which moves back up here now
+#     that this job holds no key);
 #   * the Release is created as a DRAFT and undrafted only once every asset is up. `releases/latest`
 #     is the reader's entry point and a draft is invisible to it, so a client never observes a
 #     release carrying a mirrors.json whose .minisig has not finished uploading — which is exactly
 #     the document a client would then refuse and, worse, the interleaving that looks like an
-#     attack.
+#     attack. The draft is now load-bearing a second time: the signature does not exist when the
+#     release is created (the authority signs the bytes that are already uploaded), so the draft is
+#     the state in which this run may still fail with nothing visible to anybody.
 #
-# A push publishes ONLY IF THE DOCUMENT ACTUALLY CHANGED, and the reason is the signing key rather
-# than tidiness: every publish puts PHOENIX_SIGNING_KEY into a runner, so sealing a release because
-# somebody fixed a typo in the README is key exposure bought for nothing. Two README edits did
-# exactly that before this gate existed.
+# A push publishes ONLY IF THE DOCUMENT ACTUALLY CHANGED. The reason used to be key exposure; the
+# key is gone and the reason is now the SERIAL. A dispatch spends one — the authority ratchets and
+# records the number whether or not this run ever publishes — so sealing a list because somebody
+# fixed a typo in the README burns a serial and publishes a Release that says nothing new. Two
+# README edits did exactly that before this gate existed.
 #
 # The gate compares the freshly built document against the PUBLISHED one, ignoring `serial` and
 # `signed_at` (which differ on every run by construction and say nothing about the list). It is
@@ -39,19 +49,21 @@ name: publish
 #
 # Two rules keep the gate from becoming its own silent failure: a run that CANNOT tell whether the
 # document changed fails loudly rather than guessing in either direction, and `workflow_dispatch`
-# seals unconditionally, because proving the key and the pinned tooling still work is the entire
-# job of the dry run.
+# goes through the motions unconditionally, because rehearsing them is the entire job of the dry run.
 #
 # NEVER interpolate `${{ }}` into a `run:` block. It is textual substitution performed before bash
-# parses the script, so anything from the event is executable code — and these steps hold the
-# signing key. Everything crossing that line goes through `env:` and is read as "$VAR".
+# parses the script, so anything from the event is executable code — and one of these steps holds
+# the dispatch token. Everything crossing that line goes through `env:` and is read as "$VAR".
 on:
   push:
     branches: [main]
-  # DRY RUN. Everything up to and including the seal, then stop — nothing is published. Without it,
-  # the first time PHOENIX_SIGNING_KEY is ever exercised in this repo is a real publish, which is a
-  # poor moment to find out the organisation secret was never shared here. Run it from the Actions
-  # tab after the secret, the pinned tooling ref, or this file changes.
+  # DRY RUN. Everything up to the request, then stop — nothing is dispatched and nothing is
+  # published. NOTHING IS DISPATCHED is the deliberate part: a dispatch spends a serial, so a
+  # rehearsal that asked for a signature would burn a number every time it ran. What it proves
+  # instead is everything on this side of the request — the pinned tooling, the vendored wheels, the
+  # serial rule against both its sources, the document, and the one honest thing a rehearsal can say
+  # about the transport: that the dispatch token is set. Run it from the Actions tab after the
+  # token, the pinned tooling ref, or this file changes.
   workflow_dispatch:
     inputs:
       seed:
@@ -60,15 +72,17 @@ on:
         default: false
 
 permissions:
-  contents: write        # create the Release
+  contents: write        # create the Release, upload the signature to it, undraft it
 
-# ONE publish at a time. The serial is derived by READING what is published, so two runs overlapping
-# — two pull requests merged minutes apart — both read serial N and both derive N+1. The loser then
-# collides on the tag and fails, which is loud and re-runnable, but it fails AFTER sealing and after
-# creating a draft. Serialising the job makes the second run read the first one's published result,
-# which is the number it was always meant to read. `cancel-in-progress: false` because the run being
-# cancelled is one that may already have published — and a later run never supersedes an earlier one
-# here, since each publishes its own document rather than a newer view of one shared thing.
+# ONE publish at a time. The serial is derived by READING what is published and what has been
+# sealed, so two runs overlapping — two pull requests merged minutes apart — both read serial N and
+# both derive N+1. Without this group the loser would then write its own document to the tag the
+# winner had just published, and be refused by the authority's ratchet — a serial already spent —
+# only afterwards. Serialising the job makes the second run read the first one's result, which is
+# the number it was always meant to read. `cancel-in-progress: false` because the
+# run being cancelled is one that may already have been sealed — and a later run never supersedes an
+# earlier one here, since each publishes its own document rather than a newer view of one shared
+# thing.
 concurrency:
   group: publish
   cancel-in-progress: false
@@ -77,42 +91,129 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     env:
-      # A dry run stops before anything is published, so the publishing steps key off this one
-      # value rather than each re-deriving what kind of run this is.
+      # A dry run stops before anything is dispatched or published, so the steps that do either key
+      # off this one value rather than each re-deriving what kind of run this is.
       PUBLISHING: ${{ github.event_name == 'push' }}
+      # The authority's answer, and its ledger: one world-readable branch of release-tooling carrying
+      # `sealed/<owner>/<name>/<tag>/`. Read twice below — once to pick a serial no seal has already
+      # spent, once to collect this list's signature.
+      LEDGER_BRANCH: sealed
     steps:
+      # Third-party actions are pinned to COMMIT SHAs, not tags. A tag is mutable, and every action
+      # below runs in the same job as the dispatch token with `contents: write`. The trailing
+      # comment is the human-readable version; update both together.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+
+      # The signing authority's ledger reader, the verifier and the public key clients pin all live
+      # in release-tooling — one copy shared by all payloads instead of a copy per producer that has
+      # to be kept in step. This repo carries only what it AUTHORS: the registrations and
+      # generate_mirror_list.py.
+      #
+      # `ref` is a COMMIT SHA, never a branch: what a release is checked against must be an exact
+      # named revision, so a change in release-tooling can never silently reach a producer that did
+      # not ask for it. Bumping it is a deliberate, reviewable commit here — and validate.yml
+      # resolves the same pin on the pull request that does it.
+      #
+      # It does NOT decide what SIGNS. The request below dispatches seal.yml on that repo's `main`,
+      # so the rules a signature is made under are always the authority's HEAD: the key holder
+      # decides what touches the key, and a producer pinning an old SHA cannot ask for old rules.
+      #
+      # It must run AFTER the checkout above, which cleans the workspace it lands in.
+      - name: Fetch release tooling
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
+        with:
+          repository: Pr0j3ctPh03nix/phoenix-release-tooling
+          # PLACEHOLDER — replace with the release-tooling commit that carries the seal.yml this
+          # file talks to (workflow_dispatch, with this repository in its authorization map).
+          ref: TOOLING_SHA_TBD
+          path: .tooling
+
+      # Everything that can refuse this publish, before anything is read, generated or asked for.
+      # It sits first again now that the key has left this job: it used to run below the build so
+      # that no step able to see PHOENIX_SIGNING_KEY ran on a push that published nothing, and that
+      # trade — a missing secret discovered by the next run that changes the list — has nothing left
+      # to buy.
+      - name: Preflight
+        env:
+          DISPATCH_TOKEN: ${{ secrets.PHOENIX_TOOLING_DISPATCH }}
+        run: |
+          set -euo pipefail
+          # Everything this workflow reaches into release-tooling for: the ledger reader that picks
+          # the serial, the verifier that proves what comes back, and the public half it is proved
+          # against. Missing means that checkout did not produce what this workflow expects — a
+          # moved path, or a pinned SHA from before these files existed — and the run would
+          # otherwise die at the serial or, worse, after a signature had already been made.
+          for f in .tooling/tools/ping.py .tooling/tools/phoenix_minisign.py \
+                   .tooling/keys/phoenix-active.pub; do
+            test -f "$f" || { echo "$f is missing — check the release-tooling ref pinned above"; exit 1; }
+          done
+          # The token that asks for a signature. The launcher obeys NO list it cannot verify, so a
+          # mirror list that reaches publish without one is a document every client ignores — and
+          # the symptom is not an error, it is mirrors that never appear. Checked on a dry run too:
+          # not dispatching is the one thing a rehearsal cannot rehearse, so "the secret exists" is
+          # all it has to offer.
+          test -n "$DISPATCH_TOKEN" || {
+            echo "secrets.PHOENIX_TOOLING_DISPATCH is not set, so nobody can be asked to seal this"
+            echo "list — and this repository no longer holds a key to sign it with. Mint a"
+            echo "fine-grained PAT scoped to Pr0j3ctPh03nix/phoenix-release-tooling with"
+            echo "Actions: Read and write, and add it as that secret; see .tooling/docs/sealing.md."
+            exit 1
+          }
+
+      # The generator's own rules, checked against each other before its output is trusted — and
+      # before the gate below compares that output against anything. It needs nothing installed, so
+      # it runs unconditionally: a broken generator should fail every run, not only the ones that
+      # publish.
+      - name: Selftest the generator
+        run: python generate_mirror_list.py selftest
+
       # WHICH number comes next is this producer's business, not the format's. The format says only
       # that a serial is a u64 (release-tooling's manifest_schema removed its SERIAL_FLOOR for
-      # exactly this reason); ordering is enforced client-side by a per-payload high-water mark. So
-      # the rule lives in the workflow that publishes.
+      # exactly this reason); ordering is enforced client-side by a per-payload high-water mark, and
+      # now also by the authority's ratchet, which refuses to sign a serial its ledger has seen. So
+      # the rule lives in the workflow that publishes:
       #
-      # Derived from what is actually PUBLISHED, never counted alongside it. A `run_number + offset`
-      # counter RESETS to 1 the day this file is renamed, and the reset is invisible in a diff: the
-      # new number lands under the ratchet every installed client already holds, so the list is
-      # refused by everyone who has one and nothing anywhere reports an error. The update simply
-      # never appears. Reading the published number cannot lose its place, because it holds no
-      # state to lose.
+      #     serial = max(highest serial ever SEALED for `mirrors`, the PUBLISHED one) + 1
       #
-      # TWO RULES, and both exist because a serial that goes backwards fails SILENTLY: the list
-      # publishes green and every client holding the higher number refuses it, with nothing anywhere
-      # reporting a problem.
+      # TWO SOURCES, and the maximum of them. Neither alone is enough:
+      #   * the LEDGER (`sealed`) records every serial ever signed for this payload. Sealing and
+      #     publishing are no longer the same job, so this run can be sealed at N and then die
+      #     before it undrafts — nothing is published, `published + 1` proposes N again, and the
+      #     ratchet correctly refuses it forever;
+      #   * the PUBLISHED serial covers the other direction: a deleted release makes
+      #     `releases/latest` answer with an older one, and the ledger cannot notice that.
+      # Derived from what exists, never counted alongside it. A `run_number + offset` counter RESETS
+      # to 1 the day this file is renamed, and the reset is invisible in a diff: the new number lands
+      # under the ratchet every installed client already holds, so the list is refused by everyone
+      # who has one and nothing anywhere reports an error. Reading these two cannot lose its place,
+      # because neither holds state this repo could lose.
       #
-      #   COUNT FROM THE HIGH-WATER MARK, not from the latest release. Those differ precisely when
-      #   the newest release was deleted — ordinary cleanup — after which `releases/latest` answers
-      #   with an OLDER one and the next serial lands at or below a number already handed out. The
-      #   tag IS the serial, so the mark is the largest `v<n>` this repo has ever carried, counting
-      #   drafts and prereleases too: a draft left by a failed publish still NAMED a number.
+      # This REPLACES a scan of every tag this repo has ever named (`v<n>`, drafts included), which
+      # was the closest thing available while nothing outside this repo remembered anything. The
+      # ledger is strictly better: a tag names a number, but only a SEAL spends one, and the ledger
+      # is the record of exactly that — across producers, and beyond the reach of anything deleted
+      # here. A draft left behind by a run that was never sealed therefore costs nothing; see the
+      # wait step for what a re-run does with it.
       #
-      #   NEVER SEED AUTOMATICALLY. "This line is new" and "somebody deleted the releases" look
-      #   identical from inside the job, and the second one restarting at 1 is exactly the silent
-      #   failure above. A push therefore refuses and explains; only a hand-run dispatch carrying
-      #   `seed = true` may mint the first number. This is where it differs from dist's otherwise
-      #   identical step, which forbids seeding outright because that line has always had releases.
+      # NEVER SEED AUTOMATICALLY. "This line is new" and "somebody deleted the releases" look
+      # identical from inside the job, and the second one restarting at 1 is a green publish every
+      # client refuses, reporting nothing. A push therefore refuses and explains; only a hand-run
+      # dispatch carrying `seed = true` may mint the first number. Central sealing narrows this a
+      # long way without removing it — deleted releases no longer look like a new line, because the
+      # ledger still remembers — so what is left is the case where BOTH are empty, which is genuinely
+      # ambiguous. (Serial 1 is the floor: the authority's ratchet is strictly-greater and its ping
+      # format refuses 0, so no payload can ever be sealed at 0.)
       #
-      # `set -o pipefail` and the integer test are what make "cannot read" fail instead of falling
-      # through: gh exits non-zero on an API failure, and the pipeline must not swallow it. `gh`
-      # needs no checkout, so this stays the first step. GITHUB_TOKEN is minted per run and scoped
-      # to this repository — exactly the access needed to read its own releases, and no more.
+      # `set -o pipefail` and the integer tests are what make "cannot read" fail instead of falling
+      # through: gh exits non-zero on an API failure, and the pipeline must not swallow it. A MISSING
+      # `sealed` BRANCH IS A LEGITIMATE 0 — exactly once, before anything was ever sealed anywhere —
+      # and it is told apart from "the ledger could not be read" by ls-remote's exit code, not by
+      # guessing from a failed fetch. An unreadable ledger read as empty proposes a serial that may
+      # already be spent, which is a request refused ten minutes from here.
+      #
+      # ping.py is stdlib-only for exactly this reason: it runs before any wheel is installed.
+      # GITHUB_TOKEN is minted per run and scoped to this repository — exactly the access needed to
+      # read its own releases, and no more.
       - name: Compute the list serial
         env:
           GH_TOKEN: ${{ github.token }}
@@ -121,90 +222,79 @@ jobs:
           SEED_OK: ${{ github.event.inputs.seed }}
         run: |
           set -euo pipefail
-          # The HIGHEST serial this line has ever named, across releases in ANY state — drafts and
-          # prereleases included. `releases/latest` alone was wrong in a way that only shows up
-          # afterwards: it is the newest by DATE, so deleting the newest release makes it answer with
-          # an OLDER one, and the next serial is computed from that — at or below a number already
-          # handed out, which every client that holds the higher one refuses forever.
-          #
-          # The tag IS the serial (`v<n>`, written by the publish step below), so this needs no
-          # asset downloads, and a draft left behind by a failed publish still counts: it named a
-          # number, and a number that was named must never be issued twice.
-          high=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" --jq '.[].tag_name' \
-                   | sed -n 's/^v\([0-9][0-9]*\)$/\1/p' | sort -n | tail -1)
-          published=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
-                        --jq '.[] | select(.draft == false and .prerelease == false) | .id' | wc -l)
-          if [ -z "$high" ]; then
-            # SEEDING IS NEVER AUTOMATIC. "This line has no serial yet" and "somebody deleted the
-            # releases" look identical from here, and guessing wrong restarts numbering below every
-            # installed client's ratchet — a green publish nothing accepts, reporting nothing. So a
-            # push refuses and says how to do it deliberately; only a hand-run dispatch may seed.
+          sealed=0
+          set +e
+          git -C .tooling ls-remote --exit-code --heads origin "$LEDGER_BRANCH" >/dev/null 2>&1
+          rc=$?
+          set -e
+          case "$rc" in
+            0) git -C .tooling fetch --quiet origin "$LEDGER_BRANCH"
+               # A worktree rather than a checkout: the ledger is an orphan history and must not be
+               # mistakable for the pinned tree the tools are read from.
+               git -C .tooling worktree add --quiet "$RUNNER_TEMP/ledger" FETCH_HEAD
+               # The number alone on stdout; everything else it says goes to stderr. `tr -d '\r'`
+               # because python can print CRLF into a pipe and command substitution strips only the
+               # LF — a surviving CR would break the integer test below.
+               sealed=$(python .tooling/tools/ping.py ledger --payload mirrors \
+                          --sealed "$RUNNER_TEMP/ledger" | tr -d '\r') ;;
+            2) echo "no '$LEDGER_BRANCH' branch yet — nothing has ever been sealed there" ;;
+            *) echo "cannot tell whether '$LEDGER_BRANCH' exists (git ls-remote exited $rc) —"
+               echo "refusing to treat an unreadable ledger as an empty one."
+               exit 1 ;;
+          esac
+          case "$sealed" in ''|*[!0-9]*) echo "the ledger answered '$sealed', not a number"; exit 1 ;; esac
+          # Whether this line has ever published anything, asked of the release LIST rather than of
+          # `releases/latest`: that endpoint 404s when there is none, and a 404 is not distinguishable
+          # from an unreadable one by an exit code. Drafts and prereleases do not count — a draft is
+          # invisible to every reader, so it is not a published list.
+          published_count=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+                              --jq '.[] | select(.draft == false and .prerelease == false) | .id' | wc -l)
+          if [ "$sealed" -eq 0 ] && [ "$published_count" -eq 0 ]; then
+            # SEEDING IS NEVER AUTOMATIC — see above. Nothing sealed AND nothing published is the
+            # one state where "new line" and "somebody deleted everything" are indistinguishable.
             if [ "$SEED_OK" != 'true' ]; then
-              echo "no release in $GITHUB_REPOSITORY names a serial."
+              echo "nothing has ever been sealed for payload 'mirrors', and $GITHUB_REPOSITORY has"
+              echo "published no release."
               echo "If this line is genuinely new, run this workflow from the Actions tab with"
               echo "  seed = true  to mint serial $SEED deliberately."
-              echo "If it is NOT new, releases were deleted — seeding now would publish a list every"
-              echo "existing client refuses. Restore them, or seed above the highest serial ever used."
+              echo "If it is NOT new, the releases AND the ledger were lost — seeding now would ask"
+              echo "for a serial every existing client refuses. Restore them, or seed above the"
+              echo "highest serial ever used."
               exit 1
             fi
             echo "SEEDING serial $SEED — asked for explicitly on a manual run"
             serial="$SEED"
             first=true
           else
-            echo "highest serial ever named: $high ($published published release(s))"
-            # The asset's API url, not its browser url: the latter is unauthenticated and 404s on a
-            # private repository.
-            asset=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
-                      --jq '.assets[] | select(.name == "mirrors.json") | .url')
-            [ -n "$asset" ] || { echo "the latest release carries no mirrors.json"; exit 1; }
-            # SAVED, not just read for its serial: the change gate below compares against this exact
-            # document, and fetching it twice would let the two reads disagree. It lands in
-            # RUNNER_TEMP rather than the workspace because the checkout in the next step wipes the
-            # workspace, and a file written here would go with it.
-            gh api "$asset" -H "Accept: application/octet-stream" > "$RUNNER_TEMP/published.json"
-            prev=$(jq -r '.serial' "$RUNNER_TEMP/published.json")
-            case "$prev" in ''|*[!0-9]*) echo "published serial is not a number: '$prev'"; exit 1 ;; esac
-            # Counted from the HIGH-WATER MARK, not from whatever the latest release happens to
-            # carry: those differ exactly when a newer release was deleted, which is the case this
-            # whole block exists to survive.
-            if [ "$prev" -gt "$high" ]; then high="$prev"; fi
+            prev=0
+            first=true
+            if [ "$published_count" -gt 0 ]; then
+              # The asset's API url, not its browser url: the latter is unauthenticated and 404s on
+              # a private repository.
+              asset=$(gh api "repos/$GITHUB_REPOSITORY/releases/latest" \
+                        --jq '.assets[] | select(.name == "mirrors.json") | .url')
+              [ -n "$asset" ] || { echo "the latest release carries no mirrors.json"; exit 1; }
+              # SAVED, not just read for its serial: the change gate below compares against this
+              # exact document, and fetching it twice would let the two reads disagree. It lands in
+              # RUNNER_TEMP because nothing downloaded is a file this repo authored.
+              gh api "$asset" -H "Accept: application/octet-stream" > "$RUNNER_TEMP/published.json"
+              prev=$(jq -r '.serial' "$RUNNER_TEMP/published.json")
+              case "$prev" in ''|*[!0-9]*) echo "published serial is not a number: '$prev'"; exit 1 ;; esac
+              first=false
+            else
+              # Reachable, and not an error: a first attempt that was sealed and then died before it
+              # undrafted leaves exactly this — a spent serial on the ledger and nothing published.
+              echo "nothing is published yet, but the ledger has already sealed 'mirrors' at $sealed"
+            fi
+            if [ "$prev" -gt "$sealed" ]; then high="$prev"; else high="$sealed"; fi
             serial=$(( high + 1 ))
-            first=false
-            echo "latest published serial $prev, high-water $high -> this run would publish $serial"
+            echo "sealed $sealed, published $prev -> this run publishes $serial"
           fi
           echo "PHOENIX_SERIAL=$serial" >> "$GITHUB_ENV"
           # Told to the gate explicitly rather than inferred from whether the file above exists: the
           # two questions ("was there anything published" and "did a download succeed") must not be
-          # answered by one test, which is the same confusion the seed path above exists to avoid.
+          # answered by one test, which is the same confusion the seed path exists to avoid.
           echo "PHOENIX_FIRST_PUBLISH=$first" >> "$GITHUB_ENV"
-
-      # Third-party actions are pinned to COMMIT SHAs, not tags. A tag is mutable, and every action
-      # below runs in the same job as PHOENIX_SIGNING_KEY with `contents: write`. The trailing
-      # comment is the human-readable version; update both together.
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
-
-      # The signer and the public key clients pin live in release-tooling — one copy shared by all
-      # payloads instead of a copy per producer that has to be kept in step. This repo carries only
-      # what it AUTHORS: the registrations and generate_mirror_list.py.
-      #
-      # `ref` is a COMMIT SHA, never a branch: signed bytes must name the exact revision that
-      # sealed them, so a release stays reproducible and a change in release-tooling can never
-      # silently reach a producer that did not ask for it. Bumping it is a deliberate, reviewable
-      # commit here — and validate.yml resolves the same pin on the pull request that does it.
-      #
-      # It must run AFTER the checkout above, which cleans the workspace it lands in.
-      - name: Fetch release tooling
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
-        with:
-          repository: Pr0j3ctPh03nix/phoenix-release-tooling
-          ref: 372fbace82ac673335350b59333ef7299469420d
-          path: .tooling
-
-      # The generator's own rules, checked against each other before its output is trusted — and
-      # before the gate below compares that output against anything. It needs no key, so it runs
-      # unconditionally: a broken generator should fail every run, not only the ones that publish.
-      - name: Selftest the generator
-        run: python generate_mirror_list.py selftest
 
       # `--signed-at` is supplied HERE and nowhere else. The generator never reads the clock, which
       # is what makes an unchanged mirrors.d render byte-identically; the run that knows a publish
@@ -219,15 +309,17 @@ jobs:
             --out        mirrors.json
           cat mirrors.json
 
-      # THE GATE, and it sits here for one reason: everything below can see PHOENIX_SIGNING_KEY, and
-      # nothing above it can. A push that changes no mirror therefore never puts the release key in
-      # this runner at all — which is the whole point, not a side effect of skipping work.
-      - name: Decide whether this run seals anything
+      # THE GATE. Everything below it either spends a serial at the authority or publishes a
+      # Release; nothing above it does either. A push that changes no mirror therefore asks for no
+      # signature and issues no number — which is the whole point, not a side effect of skipping
+      # work.
+      - name: Decide whether this run asks for a seal
         run: |
           set -euo pipefail
           if [ "$PUBLISHING" != 'true' ]; then
-            echo "DRY RUN — sealing unconditionally: proving the key and the pinned tooling still work"
-            echo "is this run's entire job, so it must not be skipped for an unchanged list."
+            echo "DRY RUN — going through the motions unconditionally: rehearsing the pinned"
+            echo "tooling, the wheels and the document is this run's entire job, so it must not be"
+            echo "skipped for an unchanged list. Nothing is dispatched either way."
             seal=true
           elif [ "$PHOENIX_FIRST_PUBLISH" = 'true' ]; then
             echo "FIRST PUBLISH — there is no published list to compare against."
@@ -241,93 +333,45 @@ jobs:
             # It exits non-zero on anything it could not read, so a truncated or malformed published
             # document aborts the run under `set -e` instead of being quietly read as either answer:
             # "I cannot tell" must never resolve to "unchanged" (a silent non-publish) or to
-            # "changed" (a signature nobody needed).
+            # "changed" (a serial spent for nothing).
             seal=$(python generate_mirror_list.py changed \
                      --published "$RUNNER_TEMP/published.json" --candidate mirrors.json)
             if [ "$seal" = 'true' ]; then
               echo "the list changed — this run publishes serial $PHOENIX_SERIAL"
               diff -u "$RUNNER_TEMP/published.json" mirrors.json || true
             else
-              echo "the published list already says exactly this — nothing to sign, nothing to publish"
+              echo "the published list already says exactly this — nothing to seal, nothing to publish"
             fi
           fi
           echo "PHOENIX_SEAL=$seal" >> "$GITHUB_ENV"
 
-      # The only non-stdlib dependency in the whole run, and it belongs to the signer, not to this
-      # repo: generate_mirror_list.py is stdlib-only by design.
+      # The only non-stdlib dependency in the whole run, and it belongs to the VERIFIER: this job
+      # no longer signs anything, but it does decide whether the signature that comes back is one
+      # clients will accept — and a verifier that can be made to say yes is worth exactly as much as
+      # a leaked key. generate_mirror_list.py is stdlib-only by design and needs none of it.
       #
-      # NOT FETCHED, on the same principle as the action SHAs above: this step runs in the job that
-      # holds PHOENIX_SIGNING_KEY, and `cryptography` is the code the key is handed to. This used to
-      # be a hash-pinned requirements file, which fixed WHICH bytes were acceptable but still asked
-      # an index for them while the key was a step away — the fetch, its TLS and PyPI's availability
-      # all remained inputs to the run that signs. `--no-index` deletes the question instead of
-      # constraining it: release-tooling vendors the wheels, so they arrive by the SAME pinned SHA
-      # as the seal.py that uses them, reviewed in the same bump, and from here on this job's only
-      # inputs are two git checkouts at pinned commit SHAs. It is also the one mechanism all three
-      # producers now share, rather than this repo having its own.
+      # NOT FETCHED, on the same principle as the action SHAs above. This used to be a hash-pinned
+      # requirements file, which fixed WHICH bytes were acceptable but still asked an index for them
+      # — the fetch, its TLS and PyPI's availability all remained inputs to the run. `--no-index`
+      # deletes the question instead of constraining it: release-tooling vendors the wheels, so they
+      # arrive by the SAME pinned SHA as the phoenix_minisign.py that uses them, reviewed in the same
+      # bump, and from here on this job's only inputs are two git checkouts at pinned commit SHAs.
+      # It is the one mechanism all the producers share, rather than this repo having its own.
       #
-      # `wheels/` carries the signer's whole closure (cryptography, and the cffi -> pycparser it
+      # `wheels/` carries the verifier's whole closure (cryptography, and the cffi -> pycparser it
       # imports through) for the interpreter this image ships — ubuntu-24.04, CPython 3.12. An image
       # that moves to another Python keeps exactly the property --require-hashes had: pip finds no
-      # compatible wheel and this step fails, loudly and before the key is read, rather than
+      # compatible wheel and this step fails, loudly and before anything is asked for, rather than
       # installing something unvendored. "Could not find a version that satisfies the requirement
       # ... (from versions: none)" is that failure, or a pinned SHA predating wheels/. How to
       # regenerate, and the rule that no wheel is committed whose sha256 was not cross-checked
       # against PyPI's own published digest, are in .tooling/wheels/README.md.
-      - name: Install the signing dependency
+      #
+      # A run that asks for no seal verifies nothing, so it installs nothing. A dry run does install
+      # it: resolving these wheels at all is one of the things a rehearsal exists to prove.
+      - name: Install the verifying dependency
         if: ${{ env.PHOENIX_SEAL == 'true' }}
         run: python -m pip install --disable-pip-version-check --no-index --find-links .tooling/wheels cryptography
-
-      # Everything that can refuse this publish, before anything is sealed.
-      #
-      # It used to run before the document was built, on the principle that a gate should cost
-      # seconds rather than a build. Building is instant and needs no key, so the order now follows
-      # the stronger rule instead: no step that can see the signing key may run on a push that
-      # publishes nothing. The cost of that trade is that a missing secret is discovered by the next
-      # run that actually changes the list — which is what `workflow_dispatch` is for.
-      - name: Preflight
-        if: ${{ env.PHOENIX_SEAL == 'true' }}
-        env:
-          PHOENIX_SIGNING_KEY: ${{ secrets.PHOENIX_SIGNING_KEY }}
-        run: |
-          set -euo pipefail
-          # Everything this workflow reaches into release-tooling for: the sealer, the signer it
-          # calls, and the public half sealing proves against. Missing means that checkout did not
-          # produce what this workflow expects — a moved path, or a pinned SHA from before these
-          # files existed — and the run would otherwise die at the seal with the list already built.
-          for f in .tooling/tools/seal.py .tooling/tools/phoenix_minisign.py \
-                   .tooling/keys/phoenix-active.pub; do
-            test -f "$f" || { echo "$f is missing — check the release-tooling ref pinned above"; exit 1; }
-          done
-          # The launcher obeys NO list it cannot verify, so a mirror list that reaches publish
-          # without a key is a document every client ignores — and the symptom is not an error, it
-          # is mirrors that never appear. Failing here, loudly, beats publishing something inert.
-          # PHOENIX_SIGNING_KEY is an ORGANISATION secret shared to selected repositories; if this
-          # fires on a run that used to work, this repository was dropped from that share list.
-          test -n "$PHOENIX_SIGNING_KEY" || {
-            echo "secrets.PHOENIX_SIGNING_KEY is not set — refusing to publish an unsigned mirror list"
-            exit 1
-          }
-
-      # Seal: sign the document's exact bytes, and prove the signature verifies against the public
-      # half clients pin. One command, shared with every other payload — see .tooling/tools/seal.py
-      # for why the ORDER of those two steps is the whole point. The key is read from the
-      # environment and never written to disk.
-      #
-      # `--manifest` is the flag's name because a manifest was its first caller; it signs a FILE's
-      # raw bytes and knows nothing about what is in them, which is exactly why this format needed
-      # no change there.
-      - name: Seal the mirror list
-        if: ${{ env.PHOENIX_SEAL == 'true' }}
-        env:
-          PHOENIX_SIGNING_KEY: ${{ secrets.PHOENIX_SIGNING_KEY }}
-        run: |
-          set -euo pipefail
-          python .tooling/tools/seal.py seal \
-            --manifest mirrors.json \
-            --pub      .tooling/keys/phoenix-active.pub \
-            --trusted-comment "phoenix mirrors serial $PHOENIX_SERIAL"
-          ls -l mirrors.json mirrors.json.minisig
 
       # The body quotes the document in full: it is small, and a reviewer reading the Release sees
       # the exact bytes that were signed rather than a description of them.
@@ -344,10 +388,13 @@ jobs:
           } > release-notes.md
           cat release-notes.md
 
-      # DRAFT: invisible to `releases/latest`, which is the reader's entry point, and invisible to
-      # the serial step above — so a run that dies here leaves a draft that neither publishes a
-      # half-uploaded list nor closes the seed path. `fail_on_unmatched_files` turns a missing
-      # signature into a failed run rather than a release nobody can verify.
+      # DRAFT: invisible to `releases/latest`, which is the reader's entry point, and not counted as
+      # published by the serial step above — so a run that dies from here on leaves behind something
+      # no client can see and no later run mistakes for a published list.
+      #
+      # mirrors.json ONLY: its signature does not exist yet, and the bytes uploaded here are the
+      # exact bytes the authority is about to sign. `fail_on_unmatched_files` turns a missing
+      # document into a failed run rather than an empty release.
       - name: Publish Release (draft)
         if: ${{ env.PUBLISHING == 'true' && env.PHOENIX_SEAL == 'true' }}
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2
@@ -356,10 +403,165 @@ jobs:
           name: mirrors serial ${{ env.PHOENIX_SERIAL }}
           draft: true
           body_path: release-notes.md
-          files: |
-            mirrors.json
-            mirrors.json.minisig
+          files: mirrors.json
           fail_on_unmatched_files: true
+
+      # ASK THE AUTHORITY TO SEAL IT. The document travels in the request as base64(gzip(the exact
+      # bytes uploaded above)) — a signature covers bytes, so re-serialising the JSON on either side
+      # would produce a signature over a file nobody has. The serial the authority ratchets against
+      # is read from those bytes, never from this request.
+      #
+      # A `workflow_dispatch` of seal.yml, not a `repository_dispatch`, and the difference is what
+      # the token has to be able to do: this endpoint needs only **Actions: write**, where
+      # `/repos/{owner}/{repo}/dispatches` needs **Contents: write** — which is push access to every
+      # unprotected branch of the authority, `sealed` included. That branch IS the ratchet's memory
+      # and nothing in it is signature-checked when the high-water mark is read, so a transport
+      # credential that could write to it would be a producer able to rewrite what "already sealed"
+      # means. This one cannot.
+      #
+      # `ref` is the authority's own `main` — what SIGNS is always its HEAD, never the SHA this repo
+      # pinned above, because the key holder decides what touches the key and a producer must not be
+      # able to ask for old signing rules.
+      #
+      # The token is a fine-grained PAT for that repository and no other. It cannot read the signing
+      # key — no token can, secrets are not readable through the API — and the preflight has already
+      # refused an empty one, which is why nothing re-checks it here.
+      #
+      # `--input`, never `-f` on the argv: the document is data, and a field passed on a command line
+      # is a field the shell has already had an opinion about.
+      - name: Ask the signing authority to seal the mirror list
+        if: ${{ env.PUBLISHING == 'true' && env.PHOENIX_SEAL == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.PHOENIX_TOOLING_DISPATCH }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64, gzip, json, os, sys
+
+          # GitHub caps a whole workflow_dispatch `inputs` object at 65,535 characters. Measured on
+          # the serialised object rather than on the encoded field alone, which is the conservative
+          # reading of that cap (the authority applies the same number to the field, where the other
+          # three share the remainder), and checked HERE as well as there so a document that outgrew
+          # it is named by the run that built it rather than arriving as an opaque 4xx. A mirror
+          # entry is about a hundred bytes, so this is a ceiling on thousands of them.
+          MAX = 65535
+          out = os.path.join(os.environ["RUNNER_TEMP"], "dispatch.json")
+          with open("mirrors.json", "rb") as fh:
+              raw = fh.read()
+          tag = "v" + os.environ["PHOENIX_SERIAL"]
+          # mtime=0: gzip stamps the clock into its header, and a request that differs run to run
+          # for no reason is one nobody can compare. What is signed is the decompressed bytes.
+          inputs = {"repo": os.environ["GITHUB_REPOSITORY"],
+                    "tag": tag,
+                    "manifest": base64.b64encode(gzip.compress(raw, mtime=0)).decode("ascii"),
+                    "trusted_comment": "phoenix mirror list " + tag}
+          size = len(json.dumps(inputs))
+          if size > MAX:
+              sys.exit(f"the mirror list is {len(raw)} bytes, which does not fit a {MAX}-character "
+                       f"inputs object ({size}). Nothing was dispatched.")
+          with open(out, "w", encoding="utf-8", newline="\n") as fh:
+              json.dump({"ref": "main", "inputs": inputs}, fh)
+          print(f"mirrors.json {len(raw)} bytes -> inputs {size} of {MAX} allowed")
+          PY
+          gh api --method POST \
+            /repos/Pr0j3ctPh03nix/phoenix-release-tooling/actions/workflows/seal.yml/dispatches \
+            --input "$RUNNER_TEMP/dispatch.json"
+          echo "asked to seal $GITHUB_REPOSITORY v$PHOENIX_SERIAL"
+
+      # WAIT for the answer on the ledger branch. By `git fetch`, never by raw.githubusercontent:
+      # that is CDN-cached for minutes and will answer 404 for a file that exists, which in a wait
+      # loop is a timeout on a list that was sealed perfectly well.
+      #
+      # Both files or neither: the authority writes them in one commit, and half an entry is not an
+      # answer. ping.json is NOT delivered to anybody here — a mirror list is not a payload a mirror
+      # syncs, so there is nothing to announce — it is the ledger's record of the serial, and this
+      # run reads it for exactly one thing: to say whether the entry it found is its own.
+      #
+      # Ten minutes, then give up. Every way this can fail leaves the same recoverable state: a
+      # DRAFT release, which no client can see.
+      - name: Wait for the seal
+        if: ${{ env.PUBLISHING == 'true' && env.PHOENIX_SEAL == 'true' }}
+        run: |
+          set -euo pipefail
+          entry="sealed/$GITHUB_REPOSITORY/v$PHOENIX_SERIAL"
+          found=0
+          i=0
+          while [ "$i" -lt 60 ]; do
+            # `|| true`: one failed fetch in a ten-minute wait is a blip, not an answer.
+            git -C .tooling fetch --quiet origin "$LEDGER_BRANCH" || true
+            if git -C .tooling cat-file -e "FETCH_HEAD:$entry/mirrors.json.minisig" 2>/dev/null \
+               && git -C .tooling cat-file -e "FETCH_HEAD:$entry/ping.json" 2>/dev/null; then
+              found=1
+              break
+            fi
+            i=$(( i + 1 ))
+            sleep 10
+          done
+          if [ "$found" != 1 ]; then
+            echo "no seal for $entry appeared on '$LEDGER_BRANCH' within ten minutes."
+            echo
+            echo "The release is still a DRAFT — no client can see it, and nothing has shipped."
+            echo "Look at the seal workflow in Pr0j3ctPh03nix/phoenix-release-tooling: a refusal"
+            echo "there (authorization, a document it would not accept, or a serial that does not"
+            echo "rise) leaves the ledger untouched and this run waiting."
+            echo "To retry: push again, or re-run this workflow. The serial is recomputed from the"
+            echo "ledger and the published release, so an attempt that was never sealed asks for the"
+            echo "same number and updates this same draft, while one that WAS sealed asks for a"
+            echo "higher one and leaves this draft behind to be deleted by hand."
+            echo "See .tooling/docs/sealing.md."
+            exit 1
+          fi
+          # `cat-file blob` rather than `git show`: these are bytes a signature covers, and blob
+          # output is raw by definition — no eol conversion, whatever any git config says.
+          git -C .tooling cat-file blob "FETCH_HEAD:$entry/mirrors.json.minisig" > mirrors.json.minisig
+          # RUNNER_TEMP, not the workspace: the ping is not an asset and is not published anywhere.
+          git -C .tooling cat-file blob "FETCH_HEAD:$entry/ping.json" > "$RUNNER_TEMP/ping.json"
+          echo "collected $entry from '$LEDGER_BRANCH' after $(( i * 10 ))s"
+          ls -l mirrors.json mirrors.json.minisig
+
+      # PROVE IT, before a single byte of it is published. Everything fetched above arrived from
+      # another repository, and this is what decides whether it covers the list THIS run built:
+      #   * the SERIAL first, because it is the one failure with a benign explanation — a tag can
+      #     already carry an entry from an earlier attempt, and the signature check would then fail
+      #     as "does not match the signed bytes", which is true and says nothing. Nothing is decided
+      #     on this number; the ledger is not signature-checked and this only names the cause before
+      #     the cryptography has to be interpreted;
+      #   * the SIGNATURE, against the public half CLIENTS PIN, out of the same pinned checkout. A
+      #     signature under any other key is a list no launcher will obey, and its only symptom is
+      #     mirrors that never appear.
+      #
+      # The ping's own signature is deliberately NOT checked here, and that is where this producer
+      # differs from the mod's and the launcher's: they DELIVER their ping to mirrors, so they must
+      # prove it before handing it on. Nothing is delivered from here — the ping is read for its
+      # serial and thrown away — and what this release actually ships is decided by the .minisig
+      # above.
+      - name: Verify the seal
+        if: ${{ env.PUBLISHING == 'true' && env.PHOENIX_SEAL == 'true' }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, os, sys
+
+          with open(os.path.join(os.environ["RUNNER_TEMP"], "ping.json"), encoding="utf-8") as fh:
+              doc = json.load(fh)
+          if doc["serial"] != os.environ["PHOENIX_SERIAL"]:
+              sys.exit(f"the sealed ping carries serial {doc['serial']} and this run built "
+                       f"{os.environ['PHOENIX_SERIAL']}: the ledger entry is from an earlier attempt "
+                       f"at this tag. Re-run this workflow; the serial is recomputed from the "
+                       f"ledger, so the next attempt asks for a number above it.")
+          print(f"the ledger entry is this run's: mirrors serial {doc['serial']}")
+          PY
+          python .tooling/tools/phoenix_minisign.py verify mirrors.json \
+            --pub .tooling/keys/phoenix-active.pub --sig mirrors.json.minisig
+
+      # mirrors.json.minisig is what every client checks before it obeys a byte of the list, so the
+      # release must not become visible without it. `--clobber` because a re-run that reuses this
+      # serial (one that was never sealed) is uploading to a draft that may already carry the file.
+      - name: Upload the signature to the draft
+        if: ${{ env.PUBLISHING == 'true' && env.PHOENIX_SEAL == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "v$PHOENIX_SERIAL" mirrors.json.minisig --clobber
 
       # The commit point. Everything above either succeeded or failed the job, and a failed job
       # leaves a draft behind — visible to us, invisible to every client — instead of a permanently
@@ -374,9 +576,14 @@ jobs:
       - name: Dry run summary
         if: ${{ env.PUBLISHING != 'true' }}
         run: |
-          echo "DRY RUN — sealed and verified as serial $PHOENIX_SERIAL, nothing published."
-          echo "The signing secret, the pinned tooling and the whole producer chain all work."
-          ls -l mirrors.json mirrors.json.minisig
+          echo "DRY RUN — built serial $PHOENIX_SERIAL; nothing was dispatched and nothing published."
+          echo "Exercised: the pinned tooling, the vendored wheels, the dispatch token's presence,"
+          echo "the serial rule against both the ledger and the published release, and the document."
+          echo "NOT exercised: the request, the signature and everything after it. A dispatch spends"
+          echo "a serial — the authority ratchets the number whether or not anything ships — so only"
+          echo "a push may ask for one. This includes a seed run: it mints no serial, it only shows"
+          echo "which number a push would ask for."
+          ls -l mirrors.json
 
       # The other green ending, said just as plainly. A skipped publish and a broken one both leave
       # no new release, so the run has to state which it was — otherwise the only way to tell a
@@ -384,6 +591,7 @@ jobs:
       - name: Nothing to publish
         if: ${{ env.PUBLISHING == 'true' && env.PHOENIX_SEAL != 'true' }}
         run: |
-          echo "NOTHING PUBLISHED — the mirror list is byte-for-byte what serial"
-          echo "$(( PHOENIX_SERIAL - 1 )) already says, so this push changed no mirror."
-          echo "No signature was made and the release key never entered this runner."
+          echo "NOTHING PUBLISHED — the mirror list is byte-for-byte what the currently published"
+          echo "release already says, so this push changed no mirror. No signature was asked for,"
+          echo "and serial $PHOENIX_SERIAL was not spent: the next run that does change the list"
+          echo "will ask for it."

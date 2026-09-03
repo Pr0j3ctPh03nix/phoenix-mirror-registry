@@ -1,13 +1,14 @@
 name: validate
 
-# Pull request -> build the mirror list and check it, and SIGN NOTHING.
+# Pull request -> build the mirror list and check it, and ASK FOR NO SIGNATURE.
 #
-# Signing is the merge gate. A pull request that produced a signed artifact would let a
+# Sealing is the merge gate. A pull request that produced a signed artifact would let a
 # registration reach clients with the review still open — and this repo's whole reason to exist is
 # that the list a launcher PERSISTS is decided by a person, not by whoever opened a PR. So this
-# workflow never reads the signing secret, never checks out anything that could sign on its behalf,
-# and runs with `contents: read`. A fork's pull request gets no secrets at all, which makes that
-# guarantee structural as well as stated.
+# workflow never reads the dispatch token, never asks the signing authority for anything, and runs
+# with `contents: read`. A fork's pull request gets no secrets at all, which makes that guarantee
+# structural as well as stated. This repository holds no release key at all now — sealing happens
+# in phoenix-release-tooling, on request from a token this workflow does not have.
 #
 # NEVER interpolate `${{ }}` into a `run:` block. It is textual substitution performed before bash
 # parses the script, so a branch name authored by a PR is executable code. Nothing below needs it.
@@ -27,44 +28,49 @@ jobs:
       # trailing comment is the human-readable version; update both together.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
-      # This workflow does not sign, so it needs none of these files to run. It checks them out
-      # anyway, because a PULL REQUEST is where the pin below gets bumped and reviewed — and the
-      # only thing that proves a pin is good is resolving it and looking at what came back. Without
-      # this, a bad SHA (a force-pushed branch, a typo, a revision predating seal.py) is discovered
-      # by the publish run on main, after the merge, with the list already unsignable.
+      # This workflow neither seals nor verifies, so it needs none of these files to run. It checks
+      # them out anyway, because a PULL REQUEST is where the pin below gets bumped and reviewed —
+      # and the only thing that proves a pin is good is resolving it and looking at what came back.
+      # Without this, a bad SHA (a force-pushed branch, a typo, a revision predating ping.py) is
+      # discovered by the publish run on main, after the merge, with the list already unpublishable.
       #
-      # `ref` is a COMMIT SHA, never a branch: what seals a release must be an exact named
-      # revision, so a change in release-tooling can never silently alter this producer.
+      # `ref` is a COMMIT SHA, never a branch: what a release is checked against must be an exact
+      # named revision, so a change in release-tooling can never silently alter this producer. It
+      # must be the SAME pin publish.yml carries — that is the whole point of resolving it here.
       - name: Fetch release tooling
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: Pr0j3ctPh03nix/phoenix-release-tooling
-          ref: 372fbace82ac673335350b59333ef7299469420d
+          # PLACEHOLDER — keep in step with publish.yml's pin; see the note there.
+          ref: TOOLING_SHA_TBD
           path: .tooling
 
       # Everything publish.yml reaches into release-tooling for — this repo authors its own document
-      # and takes only the sealing step from there. The point is that a PR which would fail at seal
-      # time fails here instead, so the list follows what publish.yml USES rather than what this
-      # workflow needs (it needs none of it).
+      # and takes only the serial rule and the verifier from there; the signature itself is made by
+      # that repo, not from a script copied out of it. The point is that a PR which would fail on
+      # main fails here instead, so the list follows what publish.yml USES rather than what this
+      # workflow needs (it needs none of it). seal.py is deliberately NOT on it any more: nothing
+      # here signs, so its presence would say nothing about whether a publish can succeed.
       #
       # wheels/ is on the list and is not in publish.yml's own preflight, which is not a drift:
-      # publish.yml installs from it several steps EARLIER than its preflight runs, so a missing
-      # wheels/ already fails it there and a second check could never fire. Here nothing installs,
-      # and a pin that predates the vendored wheels would otherwise be discovered on main, after the
-      # merge, with the list already unsignable. It stays in the `test -f` loop as well as under
-      # wheels_check below, because only the loop names the cause a reviewer of THIS pull request can
-      # act on — the ref pinned above — where wheels_check would suggest regenerating the file.
+      # publish.yml installs from it and would fail there, loudly, on a pin that predates them.
+      # Here nothing installs, and such a pin would otherwise be discovered on main, after the
+      # merge, with the signature it returns unverifiable. It stays in the `test -f` loop as well as
+      # under wheels_check below, because only the loop names the cause a reviewer of THIS pull
+      # request can act on — the ref pinned above — where wheels_check would suggest regenerating
+      # the file.
       - name: Preflight the pinned tooling
         run: |
           set -euo pipefail
-          for f in .tooling/tools/seal.py .tooling/tools/phoenix_minisign.py \
+          for f in .tooling/tools/ping.py .tooling/tools/phoenix_minisign.py \
                    .tooling/keys/phoenix-active.pub .tooling/wheels/SHA256SUMS; do
             test -f "$f" || { echo "$f is missing — check the release-tooling ref pinned above"; exit 1; }
           done
           echo "pinned tooling present"
-          # Presence is not enough for the wheels: they are the code the release key is handed to on
-          # main, and this is the last look at the pin before that happens. wheels_check re-hashes
-          # each one against wheels/SHA256SUMS with no network, so it proves as much here as there.
+          # Presence is not enough for the wheels: they are the code that decides on main whether a
+          # returned signature is one clients will accept, and this is the last look at the pin
+          # before that happens. wheels_check re-hashes each one against wheels/SHA256SUMS with no
+          # network, so it proves as much here as there.
           python .tooling/tools/wheels_check.py check
 
       # The generator's own rules, checked against each other. It has no dependencies, so this is
@@ -80,9 +86,9 @@ jobs:
       - name: Selftest the register helper
         run: python register_mirror.py selftest
 
-      # Serial 0 deliberately: WHICH number a list carries is decided at publish time from what is
-      # actually published (see publish.yml), and a PR must not depend on — or appear to decide —
-      # the state of the release line. What is being checked here is the mirror SET.
+      # Serial 0 deliberately: WHICH number a list carries is decided at publish time from what has
+      # been sealed and what is published (see publish.yml), and a PR must not depend on — or appear
+      # to decide — the state of the release line. What is being checked here is the mirror SET.
       - name: Build the list
         run: |
           set -euo pipefail
