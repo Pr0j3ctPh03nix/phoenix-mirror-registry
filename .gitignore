@@ -1,6 +1,7 @@
-# No PRIVATE key ever belongs in this repo. The release key reaches CI as an organisation secret
-# read straight from the environment (release-tooling's seal.py --key-env), so there is no keyfile
-# to commit by accident — and this is the net under that rule, not the rule itself.
+# No PRIVATE key ever belongs in this repo, and since sealing moved to phoenix-release-tooling
+# there is no key in this repo's CI either: it holds a dispatch token that can ask that repository
+# for a signature and nothing else. So there is no keyfile to commit by accident — and this is the
+# net under that rule, not the rule itself.
 *.key
 
 # Build outputs. mirrors.json is GENERATED from mirrors.d/ at publish time and only ever exists as
