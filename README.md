@@ -20,5 +20,7 @@ published, and it has no business sitting on a public-facing box.
 
 Either way the result is a pull request a maintainer merges — `main` requires a pull request and an
 approving review, so a registration nobody wants is a pull request that gets declined. Merging is
-what publishes: the list is rebuilt, sealed with the Phoenix release key and released as the next
-serial (`.github/workflows/publish.yml`).
+what publishes: the list is rebuilt, sent to `phoenix-release-tooling` to be sealed with the Phoenix
+release key — no key lives here — and released as `mirrors.json` plus its `mirrors.json.minisig`,
+under the next serial (`.github/workflows/publish.yml`). The serial is the list's own order rather
+than a version, and it only ever rises.
