@@ -1,0 +1,10 @@
+{
+  "base_url": "http://96.52.20.182:8080",
+  "name": "phx-ca-1",
+  "country": "CA",
+  "payloads": [
+    "mod",
+    "launcher",
+    "game"
+  ]
+}
