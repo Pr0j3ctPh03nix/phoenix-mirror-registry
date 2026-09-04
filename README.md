@@ -21,6 +21,11 @@ published, and it has no business sitting on a public-facing box.
 Either way the result is a pull request a maintainer merges — `main` requires a pull request and an
 approving review, so a registration nobody wants is a pull request that gets declined. Merging is
 what publishes: the list is rebuilt, sent to `phoenix-release-tooling` to be sealed with the Phoenix
-release key — no key lives here — and released as `mirrors.json` plus its `mirrors.json.minisig`,
-under the next serial (`.github/workflows/publish.yml`). The serial is the list's own order rather
-than a version, and it only ever rises.
+release key — no key lives here — and released as `mirrors.json` plus its `mirrors.json.minisig`
+(`.github/workflows/publish.yml`). The release is tagged `list-<short commit sha>`, naming the
+commit whose registrations it publishes.
+
+The document's `serial` is its own order rather than a version, and it only ever rises. It is
+assigned by the signing authority at the moment it seals, one above every serial it has ever issued
+for this list — so it is not in the document this repository builds, not in the tag, and not
+anything a publish here can get wrong.
