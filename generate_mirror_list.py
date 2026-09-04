@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 """Build `mirrors.json` — the signed list of hosts a launcher may download releases from.
 
-    python generate_mirror_list.py build --serial 7 --out mirrors.json
+    python generate_mirror_list.py build --out mirrors.json
     python generate_mirror_list.py selftest
 
 WHY IT IS SIGNED. The launcher PERSISTS this list: a published list replaces the mirror set
 wholesale, so one hostile answer does not mislead a single download, it permanently rewrites where
 that client fetches every future release from. The signature is the same Ed25519 release key every
-payload is sealed with (release-tooling's tools/seal.py), which is why this repo builds the document
-and never signs it itself — sealing is one shared command, not a fourth private copy of one.
+payload is sealed with, and it is made in the one place that key exists — phoenix-release-tooling's
+signing authority, asked by .github/workflows/publish.yml. This repo builds the document and never
+signs it: sealing is one shared step, not a fourth private copy of one.
+
+WHAT IT PRODUCES IS A SEAL REQUEST. Every document this script writes carries `serial: 0`, which
+names no release. The authority assigns the real number, writes it into the document and signs
+THOSE bytes, so what gets published is what comes back and this producer does no arithmetic at all.
+Nothing here reads a ledger, counts, or takes the clock — `build` is a pure function of the
+registrations it is handed, and that is load-bearing rather than tidy: a re-run over an unchanged
+`mirrors.d/` must send byte-identical bytes, which the authority answers with the seal it already
+made instead of spending a second serial.
 
 WHY IT IS NOT A MANIFEST. A mirror list has no files and no bundles, and release-tooling's
 build_manifest derives its `schema` from whether bundles are present; pushing an empty document
@@ -48,8 +57,17 @@ from typing import NoReturn
 FORMAT = 1
 
 # The payload line this document belongs to. The launcher ratchets a serial PER payload_id, so this
-# string is what keeps a mirror list's numbering from being compared against the mod's.
+# string is what keeps a mirror list's numbering from being compared against the mod's -- and it is
+# also what the signing authority reads to know this is not a payload manifest (its seal.yml's
+# `read_mirrors`).
 PAYLOAD_ID = "mirrors"
+
+# The serial of a SEAL REQUEST, which is the only kind of document this script produces. 0 names no
+# release -- nothing anywhere accepts one -- so it is the value that means "unnumbered", and the
+# authority refuses a request carrying anything else. There is no --serial to pass: which number
+# this list is published at is not a fact this repo can know, and the one that assigns it is the one
+# that signs.
+REQUEST_SERIAL = 0
 
 # Which payload trees a mirror may claim to serve. Emitted in THIS order, never the input's, so the
 # output does not record how a registration happened to be typed.
@@ -58,12 +76,6 @@ PAYLOADS = ("mod", "launcher", "game")
 # Exactly the keys an entry carries -- no more (an unknown key is a typo that would be dropped in
 # silence) and no fewer.
 ENTRY_KEYS = ("base_url", "name", "country", "payloads")
-
-# Every number in this family of formats is a u64 on the wire and a reader parses it into one, so a
-# value above this renders a document no reader can parse back. Same ceiling, same reason, as
-# release-tooling's manifest_schema.U64_MAX -- stated rather than imported, because importing it
-# would be this repo's only dependency on that module and it exists to have none.
-U64_MAX = (1 << 64) - 1
 
 # Lowercase only. `name` is an identity compared across files AND is a filename, and the two
 # filesystems this repo is edited on disagree about case: `phx-fi-1.json` and `PHX-FI-1.json` are
@@ -75,11 +87,6 @@ NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 # next to a host; an ISO 3166 list checked in here would be a copy of a moving external fact that
 # nothing in this repo can keep current, and its only power would be to refuse a legitimate mirror.
 COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
-
-# `signed_at` is ADVISORY -- no reader may fail on it, and nothing here computes it (see build()).
-# This checks only that a value handed in looks like the instant it claims to be, which is producer
-# hygiene: a garbled timestamp is quotable in a signed document forever.
-SIGNED_AT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 class MirrorListError(Exception):
@@ -242,25 +249,20 @@ def load_dir(dirpath):
 
 # --- the document -------------------------------------------------------------------------------
 
-def build(entries, serial, signed_at=None):
-    """The mirror list document. Pure: no clock, no filesystem, no network.
+def build(entries):
+    """The mirror list document, as a SEAL REQUEST. Pure: no clock, no filesystem, no network, and
+    no input but the registrations -- so the same set always renders the same bytes.
 
-    `signed_at` is never defaulted to "now" -- taking the clock here would make two runs over
-    unchanged input produce different bytes, and byte-identical output is what lets a reviewer
-    confirm that a diff in the published list is exactly the diff in mirrors.d. The caller that
-    knows a publish is happening (the publish workflow) supplies the instant; a local or
-    pull-request build simply omits the key.
+    That purity is what the publish workflow's idempotency rests on (see this module's docstring): a
+    re-run over an unchanged mirrors.d asks the authority to seal bytes it has already sealed, and
+    is answered with the existing seal rather than a second serial. It is also what lets a reviewer
+    confirm that a diff in the published list is exactly the diff in mirrors.d.
+
+    `serial` is therefore not a parameter and `signed_at` is not emitted at all: the first is the
+    authority's to write, and the second was the clock -- an advisory field the launcher's reader
+    deliberately does not even declare (its mirror.rs), whose only remaining effect would have been
+    to make two runs over one commit two different documents.
     """
-    if isinstance(serial, bool) or not isinstance(serial, int):
-        # bool is a subclass of int in Python, and `True` would render as `true` -- a JSON boolean
-        # where every reader expects a number. Same trap release-tooling's Int/Enum guard against.
-        raise MirrorListError(f"serial must be an integer, not {type(serial).__name__}")
-    if not 0 <= serial <= U64_MAX:
-        raise MirrorListError(f"serial must be a u64 (0..{U64_MAX}): {serial}")
-    if signed_at is not None and (not isinstance(signed_at, str)
-                                  or not SIGNED_AT_RE.match(signed_at)):
-        raise MirrorListError(f"signed_at must look like 2026-09-01T11:00:00Z: {signed_at!r}")
-
     by_name, by_url = {}, {}
     for entry in entries:
         check_entry(entry)
@@ -279,10 +281,8 @@ def build(entries, serial, signed_at=None):
     doc = {
         "format": FORMAT,
         "payload_id": PAYLOAD_ID,
-        "serial": serial,
+        "serial": REQUEST_SERIAL,
     }
-    if signed_at is not None:
-        doc["signed_at"] = signed_at
     # Sorted by name, not by input order: the output must depend on the SET of registrations and
     # nothing else, so that an unchanged mirrors.d re-renders byte for byte.
     doc["mirrors"] = [
@@ -298,9 +298,13 @@ def build(entries, serial, signed_at=None):
 
 
 def render(doc):
-    """The exact bytes that get signed. LF, two-space indent, UTF-8, one trailing newline -- the
-    same framing release-tooling's build_manifest.write uses, so every signed document this project
-    publishes looks the same in a diff and in a hexdump."""
+    """The document's bytes: LF, two-space indent, UTF-8, one trailing newline.
+
+    Deliberately the same four settings as release-tooling's build_manifest.render, which is the
+    canonical serialization of this family of formats -- and which the AUTHORITY re-renders this
+    document with once it has written the serial in, so strictly only the parsed content of what is
+    sent here matters. Matching it anyway is what makes the file a reviewer reads, the file that is
+    dispatched and the file that comes back sealed the same document modulo one number."""
     return json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
 
 
@@ -314,9 +318,13 @@ def write(path, text):
 
 # --- has anything actually changed? ---------------------------------------------------------------
 
-# The two fields that differ on EVERY publish by construction and say nothing about the list:
-# `serial` rises once per publish, and `signed_at` is the clock. Comparing documents without
-# excluding them would report "changed" always, which is the same as not comparing at all.
+# The two fields that differ between a published list and a freshly built one by construction, and
+# say nothing about the list itself. `serial`: what is published carries the number the authority
+# assigned, and what is built here always carries 0 -- so this is no longer merely bookkeeping that
+# rises, it is a field the two sides can never agree on. `signed_at`: no longer emitted at all (see
+# build), but a document published before that change carries one, and it was always the clock.
+# Comparing without excluding them would report "changed" always, which is the same as not
+# comparing at all.
 VOLATILE = ("serial", "signed_at")
 
 
@@ -397,108 +405,111 @@ def _selftest():
 
     # --- the document it produces
     ok("a one-mirror list renders exactly the documented shape",
-       lambda: assert_(build([entry()], 1) == {
-           "format": 1, "payload_id": "mirrors", "serial": 1,
+       lambda: assert_(build([entry()]) == {
+           "format": 1, "payload_id": "mirrors", "serial": 0,
            "mirrors": [{"base_url": "https://mirror.example", "name": "phx-fi-1",
                         "country": "FI", "payloads": ["mod", "launcher", "game"]}]},
-           f"unexpected document: {build([entry()], 1)!r}"))
+           f"unexpected document: {build([entry()])!r}"))
     ok("an empty mirrors.d is a valid list — the publisher stating there are none",
-       lambda: assert_(build([], 1)["mirrors"] == [], "an empty list was not rendered"))
-    ok("signed_at is absent, not null, when none is supplied",
-       lambda: assert_("signed_at" not in build([entry()], 1), "signed_at appeared unbidden"))
-    ok("signed_at is carried through verbatim when supplied",
-       lambda: assert_(build([entry()], 1, "2026-09-01T11:00:00Z")["signed_at"]
-                       == "2026-09-01T11:00:00Z", "signed_at was rewritten"))
-    ok("serial 0 is a u64", lambda: build([entry()], 0))
-    ok("the largest u64 is a serial", lambda: build([entry()], U64_MAX))
+       lambda: assert_(build([])["mirrors"] == [], "an empty list was not rendered"))
+    # The two fields this producer stopped writing, and the reason each of them is checked as an
+    # ABSENCE: a serial names a release this repo cannot know it is publishing at, and a signed_at
+    # is the clock, which would make two runs over one commit two documents and cost a serial at the
+    # authority every time (see build).
+    ok("every document is a seal request: serial 0, which names no release",
+       lambda: assert_(build([entry()])["serial"] == 0, "a request must carry serial 0"))
+    ok("an empty list is a seal request too",
+       lambda: assert_(build([])["serial"] == 0, "a request must carry serial 0"))
+    ok("signed_at is never emitted, whatever the caller does — there is no way to ask for one",
+       lambda: assert_("signed_at" not in build([entry()]), "signed_at appeared unbidden"))
 
     # --- determinism: the same set in any order is the same bytes
     ok("mirror order follows the name, not the input order",
-       lambda: assert_(render(build([entry(), other()], 1)) == render(build([other(), entry()], 1)),
+       lambda: assert_(render(build([entry(), other()])) == render(build([other(), entry()])),
                        "input order reached the output"))
     ok("payloads are emitted in the format's order, not the input's",
-       lambda: assert_(build([entry(payloads=["game", "mod"])], 1)["mirrors"][0]["payloads"]
+       lambda: assert_(build([entry(payloads=["game", "mod"])])["mirrors"][0]["payloads"]
                        == ["mod", "game"], "input order reached the output"))
     ok("two renders of one input are byte-identical",
-       lambda: assert_(render(build([entry(), other()], 1))
-                       == render(build([entry(), other()], 1)), "render is not a function"))
+       lambda: assert_(render(build([entry(), other()]))
+                       == render(build([entry(), other()])), "render is not a function"))
 
     # --- the URL rule, against the launcher's own canonical form
     ok("the launcher's canonical form agrees on a good URL",
        lambda: assert_(launcher_canonical("https://mirror.example") == "https://mirror.example",
                        "canonical form disagrees"))
     ok("http:// — the same two schemes the launcher accepts, transport being no part of trust",
-       lambda: build([entry(base_url="http://mirror.example")], 1))
+       lambda: build([entry(base_url="http://mirror.example")]))
     ok("a port, which no rule here has an opinion about",
-       lambda: build([entry(base_url="http://mirror.example:8080")], 1))
+       lambda: build([entry(base_url="http://mirror.example:8080")]))
     refused("a scheme that is neither http nor https",
-            lambda: build([entry(base_url="ftp://mirror.example")], 1))
+            lambda: build([entry(base_url="ftp://mirror.example")]))
     refused("a trailing slash, which the launcher would strip",
-            lambda: build([entry(base_url="https://mirror.example/")], 1))
+            lambda: build([entry(base_url="https://mirror.example/")]))
     refused("surrounding whitespace, which the launcher would trim",
-            lambda: build([entry(base_url=" https://mirror.example")], 1))
+            lambda: build([entry(base_url=" https://mirror.example")]))
     refused("a scheme with nothing after it",
-            lambda: build([entry(base_url="https://")], 1))
+            lambda: build([entry(base_url="https://")]))
     refused("no scheme at all",
-            lambda: build([entry(base_url="mirror.example")], 1))
+            lambda: build([entry(base_url="mirror.example")]))
     refused("a non-ASCII host that was never punycoded",
-            lambda: build([entry(base_url="https://зеркало.example")], 1))
+            lambda: build([entry(base_url="https://зеркало.example")]))
     refused("a base_url that is not a string",
-            lambda: build([entry(base_url=None)], 1))
+            lambda: build([entry(base_url=None)]))
 
     # --- identity and uniqueness
-    refused("two mirrors with one name", lambda: build([entry(), entry()], 1))
+    refused("two mirrors with one name", lambda: build([entry(), entry()]))
     refused("two mirrors publishing one base_url",
-            lambda: build([entry(), other(base_url="https://mirror.example")], 1))
+            lambda: build([entry(), other(base_url="https://mirror.example")]))
     refused("one base_url differing only in case",
-            lambda: build([entry(), other(base_url="https://MIRROR.example")], 1))
-    refused("an uppercase name", lambda: build([entry(name="PHX-FI-1")], 1))
-    refused("a name starting with a dash", lambda: build([entry(name="-fi")], 1))
-    refused("an empty name", lambda: build([entry(name="")], 1))
+            lambda: build([entry(), other(base_url="https://MIRROR.example")]))
+    refused("an uppercase name", lambda: build([entry(name="PHX-FI-1")]))
+    refused("a name starting with a dash", lambda: build([entry(name="-fi")]))
+    refused("an empty name", lambda: build([entry(name="")]))
 
     # --- fields
-    refused("a lowercase country", lambda: build([entry(country="fi")], 1))
-    refused("a three-letter country", lambda: build([entry(country="FIN")], 1))
-    refused("an empty payloads list", lambda: build([entry(payloads=[])], 1))
-    refused("an unknown payload", lambda: build([entry(payloads=["shim"])], 1))
-    refused("a payload listed twice", lambda: build([entry(payloads=["mod", "mod"])], 1))
-    refused("payloads given as a bare string", lambda: build([entry(payloads="mod")], 1))
-    refused("a missing key", lambda: build([{k: v for k, v in entry().items() if k != "country"}], 1))
+    refused("a lowercase country", lambda: build([entry(country="fi")]))
+    refused("a three-letter country", lambda: build([entry(country="FIN")]))
+    refused("an empty payloads list", lambda: build([entry(payloads=[])]))
+    refused("an unknown payload", lambda: build([entry(payloads=["shim"])]))
+    refused("a payload listed twice", lambda: build([entry(payloads=["mod", "mod"])]))
+    refused("payloads given as a bare string", lambda: build([entry(payloads="mod")]))
+    refused("a missing key", lambda: build([{k: v for k, v in entry().items() if k != "country"}]))
     refused("a typo'd key beside the real ones",
-            lambda: build([dict(entry(), payload=["mod"])], 1))
-    refused("a mirror that is not an object", lambda: build(["https://mirror.example"], 1))
+            lambda: build([dict(entry(), payload=["mod"])]))
+    refused("a mirror that is not an object", lambda: build(["https://mirror.example"]))
 
-    # --- the serial
-    refused("a negative serial", lambda: build([entry()], -1))
-    refused("a serial above u64", lambda: build([entry()], U64_MAX + 1))
-    refused("a serial that is a bool (True == 1 in Python)", lambda: build([entry()], True))
-    refused("a serial that is a string", lambda: build([entry()], "1"))
-    refused("a malformed signed_at", lambda: build([entry()], 1, "2026-09-01 11:00"))
-
-    # --- has anything actually changed? the question that decides whether CI signs at all, so a
-    #     false "no" is a registration that merged green and never shipped
+    # --- has anything actually changed? the question that decides whether CI asks for a seal at
+    #     all, so a false "no" is a registration that merged green and never shipped. The PUBLISHED
+    #     side of every comparison below is written as a sealed document — this producer's own
+    #     output with the two fields the authority (or an older publish) put there — because that is
+    #     exactly what the workflow compares against, and the only shape in which they can differ.
+    sealed = lambda doc, serial=3, **over: dict(doc, serial=serial, **over)   # noqa: E731
     ok("the same list is unchanged",
-       lambda: assert_(not differs(build([entry()], 1), build([entry()], 1)), "reported a change"))
-    ok("a rising serial alone is not a change",
-       lambda: assert_(not differs(build([entry()], 1), build([entry()], 99)), "the serial leaked"))
-    ok("a different signed_at alone is not a change",
-       lambda: assert_(not differs(build([entry()], 1, "2026-01-01T00:00:00Z"),
-                                   build([entry()], 2, "2026-09-09T09:09:09Z")),
+       lambda: assert_(not differs(sealed(build([entry()])), build([entry()])),
+                       "reported a change"))
+    ok("the assigned serial alone is not a change",
+       lambda: assert_(not differs(sealed(build([entry()]), 99), build([entry()])),
+                       "the serial leaked"))
+    ok("a signed_at on the published list alone is not a change",
+       lambda: assert_(not differs(sealed(build([entry()]), signed_at="2026-01-01T00:00:00Z"),
+                                   build([entry()])),
                        "the clock leaked into the comparison"))
-    ok("signed_at present vs absent is not a change",
-       lambda: assert_(not differs(build([entry()], 1), build([entry()], 1, "2026-09-01T11:00:00Z")),
-                       "an absent advisory field read as a change"))
+    ok("two different signed_at values are not a change either",
+       lambda: assert_(not differs(sealed(build([entry()]), signed_at="2026-01-01T00:00:00Z"),
+                                   sealed(build([entry()]), 4, signed_at="2026-09-09T09:09:09Z")),
+                       "the clock leaked into the comparison"))
     ok("adding a mirror IS a change",
-       lambda: assert_(differs(build([entry()], 1), build([entry(), other()], 1)),
+       lambda: assert_(differs(sealed(build([entry()])), build([entry(), other()])),
                        "a new mirror would never have been published"))
     ok("removing a mirror IS a change",
-       lambda: assert_(differs(build([entry(), other()], 1), build([entry()], 1)),
+       lambda: assert_(differs(sealed(build([entry(), other()])), build([entry()])),
                        "a retired mirror would never have been withdrawn"))
     ok("changing one field of one mirror IS a change",
-       lambda: assert_(differs(build([entry()], 1), build([entry(country="SE")], 1)),
+       lambda: assert_(differs(sealed(build([entry()])), build([entry(country="SE")])),
                        "an edited registration would never have shipped"))
     ok("a different payload set IS a change",
-       lambda: assert_(differs(build([entry()], 1), build([entry(payloads=["mod"])], 1)),
+       lambda: assert_(differs(sealed(build([entry()])), build([entry(payloads=["mod"])])),
                        "a mirror that dropped a payload would still be advertised for it"))
 
     # --- the directory, which needs real files
@@ -549,7 +560,7 @@ def _selftest():
     here = os.path.join(os.path.dirname(os.path.abspath(__file__)), DEFAULT_DIR)
     if os.path.isdir(here):
         ok(f"this repo's own {DEFAULT_DIR}/ builds",
-           lambda: assert_(build(load_dir(here), 1)["payload_id"] == PAYLOAD_ID, "wrong payload_id"))
+           lambda: assert_(build(load_dir(here))["payload_id"] == PAYLOAD_ID, "wrong payload_id"))
 
     for good, name, detail in results:
         print(f"  {'ok  ' if good else 'FAIL'} {name}" + (f"\n         {detail}" if detail else ""))
@@ -572,15 +583,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    b = sub.add_parser("build", help="render mirrors.d/ into a mirror list document")
-    b.add_argument("--serial", required=True, type=int,
-                   help="this list's place in its own order; the publisher decides the number "
-                        "(see .github/workflows/publish.yml)")
+    b = sub.add_parser("build", help="render mirrors.d/ into a mirror list SEAL REQUEST")
     b.add_argument("--mirrors-dir", default=DEFAULT_DIR,
                    help="directory of per-mirror registrations (default: %(default)s)")
     b.add_argument("--out", default=DEFAULT_OUT, help="output path (default: %(default)s)")
-    b.add_argument("--signed-at", help="advisory publish instant, e.g. 2026-09-01T11:00:00Z; "
-                                       "omitted from the document when not given")
 
     c = sub.add_parser("changed", help="does a candidate list differ from the published one?")
     c.add_argument("--published", required=True, help="the currently published mirrors.json")
@@ -604,13 +610,13 @@ def main():
         return
 
     try:
-        doc = build(load_dir(a.mirrors_dir), a.serial, a.signed_at)
+        doc = build(load_dir(a.mirrors_dir))
     except MirrorListError as e:
         die(str(e))
     text = render(doc)
     write(a.out, text)
-    print(f"mirror-list: {a.out} — serial {doc['serial']}, {len(doc['mirrors'])} mirror(s), "
-          f"{len(text.encode('utf-8'))} bytes")
+    print(f"mirror-list: {a.out} — a seal request at serial {doc['serial']}, "
+          f"{len(doc['mirrors'])} mirror(s), {len(text.encode('utf-8'))} bytes")
     for m in doc["mirrors"]:
         print(f"  {m['name']:<16} {m['country']}  {m['base_url']}  [{' '.join(m['payloads'])}]")
 

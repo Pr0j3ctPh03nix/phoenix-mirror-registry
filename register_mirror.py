@@ -373,8 +373,8 @@ def register(repo, arg_url):
     print(f"\nPushed {branch}. Open the pull request:\n  {url}\n")
     print("Then: wait for `validate` to go green (it builds the list with your entry in it), and "
           "ask a\nmaintainer to review and merge. Merging to "
-          f"{MAIN} is what publishes — `publish.yml` seals the\nnew list and releases it as the "
-          "next serial.")
+          f"{MAIN} is what publishes — `publish.yml` has the\nnew list sealed by "
+          "phoenix-release-tooling and releases it.")
     return url
 
 
@@ -625,7 +625,7 @@ def _selftest():
                "the written file did not load"))
         ok("and one that builds into a list",
            lambda: assert_(mirror_list.build(
-               mirror_list.load_dir(os.path.join(tmp, "mirrors.d")), 1)["mirrors"][0]["name"]
+               mirror_list.load_dir(os.path.join(tmp, "mirrors.d")))["mirrors"][0]["name"]
                == "phx-fi-1", "the written file did not build"))
 
         def second_run():

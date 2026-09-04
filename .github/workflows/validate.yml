@@ -29,48 +29,36 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
 
       # This workflow neither seals nor verifies, so it needs none of these files to run. It checks
-      # them out anyway, because a PULL REQUEST is where the pin below gets bumped and reviewed —
-      # and the only thing that proves a pin is good is resolving it and looking at what came back.
-      # Without this, a bad SHA (a force-pushed branch, a typo, a revision predating ping.py) is
+      # them out anyway, and `v1` is deliberately the SAME moving tag publish.yml resolves: what a
+      # producer gets from this repository moves under it (the trade is argued in
+      # .tooling/docs/publishing.md), so the only honest thing a pull request can check is that it
+      # resolves to a tree that can publish, right now. Without this, a `v1` that does not — a bad
+      # release of the tooling, a tag left pointing at something that never carried these paths — is
       # discovered by the publish run on main, after the merge, with the list already unpublishable.
-      #
-      # `ref` is a COMMIT SHA, never a branch: what a release is checked against must be an exact
-      # named revision, so a change in release-tooling can never silently alter this producer. It
-      # must be the SAME pin publish.yml carries — that is the whole point of resolving it here.
       - name: Fetch release tooling
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4
         with:
           repository: Pr0j3ctPh03nix/phoenix-release-tooling
-          ref: 0eb43683fc0969902a4ead9e9ef05c16979b1c90
+          ref: v1
           path: .tooling
 
-      # Everything publish.yml reaches into release-tooling for — this repo authors its own document
-      # and takes only the serial rule and the verifier from there; the signature itself is made by
-      # that repo, not from a script copied out of it. The point is that a PR which would fail on
-      # main fails here instead, so the list follows what publish.yml USES rather than what this
-      # workflow needs (it needs none of it). seal.py is deliberately NOT on it any more: nothing
-      # here signs, so its presence would say nothing about whether a publish can succeed.
-      #
-      # wheels/ is on the list and is not in publish.yml's own preflight, which is not a drift:
-      # publish.yml installs from it and would fail there, loudly, on a pin that predates them.
-      # Here nothing installs, and such a pin would otherwise be discovered on main, after the
-      # merge, with the signature it returns unverifiable. It stays in the `test -f` loop as well as
-      # under wheels_check below, because only the loop names the cause a reviewer of THIS pull
-      # request can act on — the ref pinned above — where wheels_check would suggest regenerating
-      # the file.
-      - name: Preflight the pinned tooling
+      # The same three paths publish.yml's own preflight refuses to proceed without — this repo
+      # authors its own document and takes nothing else from there; the signature is made by that
+      # repo, not from a script copied out of it. The point is that a pull request which would fail
+      # on main fails here instead, so the list follows what publish.yml checks rather than what
+      # this workflow needs (it needs none of it).
+      - name: Preflight the tooling
         run: |
           set -euo pipefail
-          for f in .tooling/tools/ping.py .tooling/tools/phoenix_minisign.py \
-                   .tooling/keys/phoenix-active.pub .tooling/wheels/SHA256SUMS; do
-            test -f "$f" || { echo "$f is missing — check the release-tooling ref pinned above"; exit 1; }
+          for f in .tooling/phx.py .tooling/keys/phoenix-active.pub .tooling/wheels/SHA256SUMS; do
+            test -f "$f" || { echo "$f is missing — Pr0j3ctPh03nix/phoenix-release-tooling@v1 does not look like a release of the tooling"; exit 1; }
           done
-          echo "pinned tooling present"
+          echo "the tooling at v1 is present"
           # Presence is not enough for the wheels: they are the code that decides on main whether a
-          # returned signature is one clients will accept, and this is the last look at the pin
-          # before that happens. wheels_check re-hashes each one against wheels/SHA256SUMS with no
-          # network, so it proves as much here as there.
-          python .tooling/tools/wheels_check.py check
+          # returned signature is one clients will accept, and a verifier that can be made to say
+          # yes is worth exactly as much as a leaked key. This re-hashes each one against
+          # wheels/SHA256SUMS with no network, so it proves as much here as there.
+          python .tooling/phx.py wheels check
 
       # The generator's own rules, checked against each other. It has no dependencies, so this is
       # the whole test suite and it runs before the registrations are read.
@@ -85,23 +73,27 @@ jobs:
       - name: Selftest the register helper
         run: python register_mirror.py selftest
 
-      # Serial 0 deliberately: WHICH number a list carries is decided at publish time from what has
-      # been sealed and what is published (see publish.yml), and a PR must not depend on — or appear
-      # to decide — the state of the release line. What is being checked here is the mirror SET.
+      # This is the whole document a publish sends, not an approximation of one: every list this
+      # generator writes is a seal request at serial 0, and the number it is published at is written
+      # in by the signing authority (see the generator's docstring). So what a pull request builds
+      # here is byte-for-byte what merging it would ask to have sealed, and what is being reviewed
+      # is the mirror SET and nothing else.
       - name: Build the list
         run: |
           set -euo pipefail
-          python generate_mirror_list.py build --serial 0 --out /tmp/mirrors.json
+          python generate_mirror_list.py build --out /tmp/mirrors.json
           cat /tmp/mirrors.json
 
-      # Determinism is a promised property of the generator, so it is checked rather than asserted:
-      # the same registrations must render the same bytes, or "the diff in the published list is
-      # the diff in mirrors.d" stops being something a reviewer can rely on. The two ways it breaks
-      # are both silent — a directory read in the OS's order, and a timestamp taken from the clock.
+      # Determinism is a promised property of the generator, so it is checked rather than asserted.
+      # It buys two things now. A reviewer's: "the diff in the published list is the diff in
+      # mirrors.d". And the publisher's, which is newer and sharper — the authority answers a
+      # re-dispatch of byte-identical bytes with the seal it already made, spending no serial, so a
+      # re-run of a publish that died mid-flight only recovers if this holds. The two ways it breaks
+      # are both silent: a directory read in the OS's order, and a timestamp taken from the clock.
       - name: Rebuild and compare, byte for byte
         run: |
           set -euo pipefail
-          python generate_mirror_list.py build --serial 0 --out /tmp/mirrors.again.json
+          python generate_mirror_list.py build --out /tmp/mirrors.again.json
           cmp /tmp/mirrors.json /tmp/mirrors.again.json
           echo "byte-identical across two runs"
 
